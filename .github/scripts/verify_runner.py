@@ -62,6 +62,11 @@ def build_entrypoint(
         #!/bin/bash
         set -uo pipefail
 
+        NFS_DIR="{nfs_result_dir}"
+        mkdir -p "$NFS_DIR"
+        POD_LOG="$NFS_DIR/pod.log"
+        exec > >(tee -a "$POD_LOG") 2>&1
+
         echo "=== SaFE verify-pr pod started at $(date -u) ==="
         echo "Script: {script}"
         echo "Points: {len(runs)}"
@@ -76,8 +81,6 @@ def build_entrypoint(
             apt-get update -qq && apt-get install -y -qq git || true
         fi
 
-        NFS_DIR="{nfs_result_dir}"
-        mkdir -p "$NFS_DIR"
         SUMMARY="$NFS_DIR/summary-{script.replace('.sh', '')}.json"
         echo '[]' > "$SUMMARY"
 

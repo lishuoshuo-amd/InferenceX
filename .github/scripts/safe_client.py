@@ -79,7 +79,7 @@ class SaFEClient:
             "entryPoints": [entry_point],
             "priority": 1,
             "maxRetry": 0,
-            "ttlSecondsAfterFinished": 0,
+            "ttlSecondsAfterFinished": 600,
             "forceHostNetwork": force_host_network,
         }
         if env_vars:
