@@ -122,7 +122,7 @@ jobs:
           mkdir -p "$HOME/bin"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           if ! command -v yq >/dev/null; then
-            wget -qO "$HOME/bin/yq" \
+            curl -fsSL -o "$HOME/bin/yq" \
               https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
             chmod +x "$HOME/bin/yq"
           fi
