@@ -188,7 +188,8 @@ def run(args: argparse.Namespace) -> int:
     )
 
     script_stem = args.script.replace(".sh", "")
-    workload_name = f"verify-{script_stem}-{args.head_sha[:8]}"
+    safe_name = script_stem.replace("_", "-").lower()
+    workload_name = f"vpr-{safe_name}-{args.head_sha[:8]}"[:44]
 
     log.info("Creating SaFE workload: %s", workload_name)
     workload = client.create_workload(
