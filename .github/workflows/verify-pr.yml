@@ -6,8 +6,9 @@ run-name: Verify PR - ${{ github.event.pull_request.title || github.sha }}
 # Distinct from upstream's `sweep-enabled` label so we don't accidentally
 # trigger run-sweep.yml (which can't run on fork without internal secrets).
 # Detects which mi355x bench scripts changed, then runs each script twice
-# inside its docker image (baseline=PR base ref, optimized=PR head ref) on
-# our self-hosted mi355x runner and posts a gain% table back to the PR.
+# (baseline=PR base ref, optimized=PR head ref) inside its docker image on
+# our SaFE ARC runner scale set and posts a gain% table back to the PR.
+# Each changed script runs as an independent matrix job (max-parallel: 6).
 
 on:
   pull_request:
@@ -78,14 +79,19 @@ jobs:
   verify:
     needs: detect
     if: needs.detect.outputs.count != '0'
-    runs-on: mi355x
+    runs-on: inferencexfork-t25db
     timeout-minutes: 600
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        script: ${{ fromJson(needs.detect.outputs.scripts) }}
     env:
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      SCRIPTS_JSON: ${{ needs.detect.outputs.scripts }}
       MODELS_ROOT: /hyperloom/models
       RANDOM_RANGE_RATIO: "0.8"
+      SCRIPT: ${{ matrix.script }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -113,42 +119,38 @@ jobs:
           ls /dev/kfd /dev/dri >/dev/null
           test -d "$MODELS_ROOT" || { echo "Missing $MODELS_ROOT"; exit 1; }
 
-      - name: Run baseline + optimized for each changed script
-        id: bench
+      - name: Run baseline + optimized for ${{ matrix.script }}
         run: |
           set -uo pipefail
           mkdir -p verify-results
-          SUMMARY=verify-results/summary.json
+          SUMMARY=verify-results/summary-${SCRIPT%.sh}.json
           echo '[]' > "$SUMMARY"
 
           run_one() {
-            # $1=script  $2=mode (baseline|optimized)  $3=ref
-            local script=$1 mode=$2 ref=$3
+            # $1=mode (baseline|optimized)  $2=ref
+            local mode=$1 ref=$2
             local cfg=".github/configs/hyperloom-verify.yaml"
             local image model tp conc isl osl mml
-            image=$(yq -r ".scripts[\"$script\"].image" $cfg)
-            model=$(yq -r ".scripts[\"$script\"].model_path" $cfg)
-            tp=$(yq -r ".scripts[\"$script\"].tp" $cfg)
-            conc=$(yq -r ".scripts[\"$script\"].conc" $cfg)
-            isl=$(yq -r ".scripts[\"$script\"].isl" $cfg)
-            osl=$(yq -r ".scripts[\"$script\"].osl" $cfg)
+            image=$(yq -r ".scripts[\"$SCRIPT\"].image" $cfg)
+            model=$(yq -r ".scripts[\"$SCRIPT\"].model_path" $cfg)
+            tp=$(yq -r ".scripts[\"$SCRIPT\"].tp" $cfg)
+            conc=$(yq -r ".scripts[\"$SCRIPT\"].conc" $cfg)
+            isl=$(yq -r ".scripts[\"$SCRIPT\"].isl" $cfg)
+            osl=$(yq -r ".scripts[\"$SCRIPT\"].osl" $cfg)
             mml=$((isl + osl + 200))
 
-            echo "::group::Run $mode @ $ref :: $script"
-            # Restore upstream bench tree at the requested ref into a fresh dir
-            local work="verify-results/${script%.sh}_${mode}"
+            echo "::group::Run $mode @ $ref :: $SCRIPT"
+            local work="verify-results/${SCRIPT%.sh}_${mode}"
             rm -rf "$work" && mkdir -p "$work"
             git --work-tree="$work" checkout "$ref" -- benchmarks utils runners 2>/dev/null || \
               git --work-tree="$work" checkout "$ref" -- benchmarks utils
 
-            # Patch hf download to no-op (model is local)
             sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \
-              "$work/benchmarks/single_node/$script"
+              "$work/benchmarks/single_node/$SCRIPT"
 
-            # Pull image (cached after first run)
             docker pull "$image" || true
 
-            local result_file="verify-${mode}-${script%.sh}"
+            local result_file="verify-${mode}-${SCRIPT%.sh}"
             set +e
             docker run --rm \
               --device=/dev/kfd --device=/dev/dri --group-add video \
@@ -162,44 +164,39 @@ jobs:
               -e RESULT_FILENAME="$result_file" \
               -e RUN_EVAL=false -e EVAL_ONLY=false -e EXP_NAME=verify \
               "$image" \
-              bash benchmarks/single_node/$script
+              bash benchmarks/single_node/$SCRIPT
             local rc=$?
             set -e
 
-            # Result JSON lands in /workspace ($work) named ${result_file}.json
             local json="$work/${result_file}.json"
             local throughput="null"
             if [[ -f "$json" ]]; then
-              # InferenceX bench_serving writes "output_throughput" (tokens/s)
               throughput=$(jq -r '.output_throughput // .total_token_throughput // .request_throughput // empty' "$json" || true)
             fi
-            cp -f "$work/server.log" "verify-results/${mode}-${script%.sh}.server.log" 2>/dev/null || true
+            cp -f "$work/server.log" "verify-results/${mode}-${SCRIPT%.sh}.server.log" 2>/dev/null || true
             [[ -f "$json" ]] && cp -f "$json" "verify-results/${result_file}.json"
 
-            jq --arg s "$script" --arg m "$mode" --arg t "${throughput:-null}" \
+            jq --arg s "$SCRIPT" --arg m "$mode" --arg t "${throughput:-null}" \
                --arg c "$conc" --arg i "$isl" --arg o "$osl" --arg rc "$rc" \
                '. += [{script:$s, mode:$m, throughput:($t|tonumber? // null),
                        conc:($c|tonumber), isl:($i|tonumber), osl:($o|tonumber),
                        exit_code:($rc|tonumber)}]' \
                "$SUMMARY" > "$SUMMARY.tmp" && mv "$SUMMARY.tmp" "$SUMMARY"
 
-            # Best-effort cleanup: kill any leftover container / process
             docker ps -q --filter "ancestor=$image" | xargs -r docker rm -f >/dev/null 2>&1 || true
             echo "::endgroup::"
           }
 
-          for script in $(echo "$SCRIPTS_JSON" | jq -r '.[]'); do
-            run_one "$script" baseline "$BASE_SHA"
-            run_one "$script" optimized "$HEAD_SHA"
-          done
+          run_one baseline "$BASE_SHA"
+          run_one optimized "$HEAD_SHA"
 
-          echo "=== summary.json ==="
+          echo "=== summary for $SCRIPT ==="
           cat "$SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: verify-pr-results
+          name: verify-pr-results-${{ matrix.script }}
           path: verify-results/
           retention-days: 30
 
@@ -210,8 +207,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: verify-pr-results
-          path: verify-results
+          path: all-results
+          pattern: verify-pr-results-*
+          merge-multiple: true
         continue-on-error: true
 
       - name: Render comment + post to PR
@@ -221,35 +219,46 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          BODY=verify-results/comment.md
-          mkdir -p verify-results
+          BODY=comment.md
 
-          if [[ ! -f verify-results/summary.json ]]; then
+          shopt -s nullglob
+          summaries=(all-results/summary-*.json)
+          if [[ ${#summaries[@]} -eq 0 ]]; then
             cat > "$BODY" <<EOF
           ### Verify PR (Hyperloom) — failed before producing results
 
-          The verify job did not upload a summary. Check the workflow logs.
+          The verify jobs did not upload any summary. Check the workflow logs.
           EOF
           else
-            python3 - <<'PY' > "$BODY"
-          import json, pathlib
-          rows = json.loads(pathlib.Path("verify-results/summary.json").read_text())
+            python3 - "${summaries[@]}" > "$BODY" <<'PY'
+          import json, sys, pathlib
+          rows = []
+          for p in sys.argv[1:]:
+              try:
+                  rows.extend(json.loads(pathlib.Path(p).read_text()))
+              except Exception as e:
+                  print(f"<!-- failed to read {p}: {e} -->")
           by_script = {}
           for r in rows:
               by_script.setdefault(r["script"], {})[r["mode"]] = r
-          print("### Verify PR (Hyperloom)\n")
-          print("| Script | conc | baseline (tok/s) | optimized (tok/s) | gain | verdict |")
-          print("|---|---|---|---|---|---|")
+          print("### Verify PR (Hyperloom) — Unofficial smoke test\n")
+          print("> Only the upstream [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) repo")
+          print("> contains the Official InferenceX result. This fork verify is an Unofficial smoke")
+          print("> test using a single (tp, conc) point per script; authoritative comparison runs")
+          print("> on upstream after PR is opened against SemiAnalysisAI/InferenceX.\n")
+          print("| Script | tp | conc | baseline (tok/s) | optimized (tok/s) | gain | verdict |")
+          print("|---|---|---|---|---|---|---|")
           for s, modes in sorted(by_script.items()):
               b = modes.get("baseline", {}); o = modes.get("optimized", {})
               bt, ot = b.get("throughput"), o.get("throughput")
+              tp = "?"  # tp is in hyperloom-verify.yaml, not in summary; could enrich later
+              conc = b.get("conc") or o.get("conc")
               if bt and ot:
                   gain = (ot - bt) / bt * 100
-                  verdict = "PASS" if gain >= 0 else "REGRESS"
-                  print(f"| `{s}` | {b.get('conc')} | {bt:.2f} | {ot:.2f} | {gain:+.2f}% | {verdict} |")
+                  verdict = "OK" if gain >= -2.0 else "WARN: regression"
+                  print(f"| `{s}` | {tp} | {conc} | {bt:.2f} | {ot:.2f} | {gain:+.2f}% | {verdict} |")
               else:
-                  print(f"| `{s}` | {b.get('conc')} | {bt or 'FAIL'} | {ot or 'FAIL'} | n/a | FAIL |")
-          print("\n_Single conc point per script; expand later by editing `.github/configs/hyperloom-verify.yaml`._")
+                  print(f"| `{s}` | {tp} | {conc} | {bt or 'FAIL'} | {ot or 'FAIL'} | n/a | FAIL |")
           PY
           fi
 
