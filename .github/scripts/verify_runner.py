@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -188,7 +189,7 @@ def run(args: argparse.Namespace) -> int:
     )
 
     script_stem = args.script.replace(".sh", "")
-    safe_name = script_stem.replace("_", "-").lower()
+    safe_name = re.sub(r"[^a-z0-9-]", "-", script_stem.lower()).strip("-")
     workload_name = f"vpr-{safe_name}-{args.head_sha[:8]}"[:44]
 
     log.info("Creating SaFE workload: %s", workload_name)
