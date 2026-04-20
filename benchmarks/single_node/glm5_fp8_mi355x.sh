@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-
+# verify-pr: include in full 6-model sweep
 source "$(dirname "$0")/../benchmark_lib.sh"
 
 check_env_vars \

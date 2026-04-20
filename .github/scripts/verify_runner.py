@@ -219,25 +219,62 @@ def run(args: argparse.Namespace) -> int:
 
     log.info("Workload submitted: %s", workload_id)
 
-    status = client.poll_until_done(
-        workload_id,
-        timeout=args.timeout,
-        interval=30,
-        heartbeat_interval=300,
-    )
-    log.info("Workload %s finished: %s", workload_id, status)
+    # Poll with live log tailing from NFS
+    pod_log_path = Path(nfs_result_dir) / "pod.log"
+    log_offset = 0
+    start = time.time()
+    status = "running"
 
-    # Dump pod log from NFS to CI stdout
-    pod_log = Path(nfs_result_dir) / "pod.log"
-    if pod_log.exists():
-        content = pod_log.read_text(errors="replace")
-        print(f"\n{'=' * 60}")
-        print(f"POD LOG ({args.script})")
-        print(f"{'=' * 60}")
-        print(content[-50000:] if len(content) > 50000 else content)
-        print(f"{'=' * 60}\n")
-    else:
-        log.warning("No pod.log found at %s", pod_log)
+    while True:
+        elapsed = time.time() - start
+        if elapsed > args.timeout:
+            log.warning("Timeout after %ds, stopping workload", args.timeout)
+            client.stop_workload(workload_id)
+            status = "timeout"
+            break
+
+        try:
+            wl_status, wl_phase = client.get_workload_status(workload_id)
+        except Exception as e:
+            log.warning("Poll error: %s", e)
+            time.sleep(30)
+            continue
+
+        # Stream pod.log incremental content
+        if pod_log_path.exists():
+            try:
+                with open(pod_log_path, "r", errors="replace") as f:
+                    f.seek(log_offset)
+                    new_content = f.read()
+                    if new_content:
+                        print(new_content, end="", flush=True)
+                        log_offset += len(new_content)
+            except Exception:
+                pass
+
+        if wl_phase in ("succeeded", "completed") or wl_status in ("succeeded", "completed"):
+            log.info("Workload %s completed (%.0fs)", workload_id, elapsed)
+            status = "completed"
+            break
+        if wl_phase == "failed" or wl_status == "failed":
+            log.error("Workload %s failed (%.0fs)", workload_id, elapsed)
+            status = "failed"
+            break
+
+        time.sleep(30)
+
+    # Final flush of pod log
+    if pod_log_path.exists():
+        try:
+            with open(pod_log_path, "r", errors="replace") as f:
+                f.seek(log_offset)
+                remaining = f.read()
+                if remaining:
+                    print(remaining, end="", flush=True)
+        except Exception:
+            pass
+
+    log.info("Workload %s finished: %s", workload_id, status)
 
     # Collect results from NFS -> local output dir
     output_dir = Path(args.output_dir)
