@@ -1,0 +1,34 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # daily UTC 01:00 (~ Beijing 09:00)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward main from SemiAnalysisAI/InferenceX
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/SemiAnalysisAI/InferenceX.git
+          git fetch upstream main
+          git checkout main
+          BEHIND=$(git rev-list --count main..upstream/main)
+          if [ "$BEHIND" = "0" ]; then
+            echo "Already up-to-date with upstream/main"
+            exit 0
+          fi
+          echo "Fork main is $BEHIND commit(s) behind upstream, fast-forwarding"
+          git merge --ff-only upstream/main
+          git push origin main
