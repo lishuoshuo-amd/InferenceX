@@ -57,6 +57,7 @@ vllm serve $MODEL --port $PORT \
   --gpu-memory-utilization 0.95 \
   --max-model-len $MAX_MODEL_LEN \
   --block-size=64 \
+  --max-num-seqs 512 \
   --no-enable-prefix-caching > $SERVER_LOG 2>&1 &
 
 SERVER_PID=$!

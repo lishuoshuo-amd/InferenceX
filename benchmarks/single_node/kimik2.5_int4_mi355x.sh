@@ -42,7 +42,7 @@ vllm serve $MODEL --port $PORT \
 --block-size=64 \
 --trust-remote-code \
 --no-enable-prefix-caching \
---max-num-seqs 256 \
+--max-num-seqs 512 \
 --mm-encoder-tp-mode data > $SERVER_LOG 2>&1 &
 
 SERVER_PID=$!

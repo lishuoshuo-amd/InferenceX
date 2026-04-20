@@ -1,4 +1,17 @@
 - config-keys:
+  - dsr1-fp8-mi355x-sglang
+  - gptoss-fp4-mi355x-vllm
+  - kimik2.5-int4-mi355x-vllm
+  - qwen3.5-bf16-mi355x-sglang
+  description:
+  - 'dsr1-fp8-mi355x-sglang: --num-continuous-decode-steps: 4 -> 8'
+  - 'gptoss-fp4-mi355x-vllm: Add --max-num-seqs 512'
+  - 'kimik2.5-int4-mi355x-vllm: --max-num-seqs: 256 -> 512'
+  - 'qwen3.5-bf16-mi355x-sglang: Add --enable-mixed-chunk; Add --num-continuous-decode-steps
+    8'
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/XXX
+
+- config-keys:
     - kimik2.5-fp4-gb200-dynamo-trt
   description:
     - "Add Kimi K2.5 NVFP4 GB200 disaggregated TRT-LLM benchmarks via Dynamo (14 STP configs)"
