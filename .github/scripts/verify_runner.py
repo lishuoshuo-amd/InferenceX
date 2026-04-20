@@ -97,20 +97,19 @@ def build_entrypoint(
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
             echo "--- Run $tag @ $ref ---"
-            local work="/tmp/work_${{tag}}"
-            rm -rf "$work" && mkdir -p "$work"
+            rm -rf /workspace && mkdir -p /workspace
 
             cd "$REPO_DIR"
-            git --work-tree="$work" checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
-                git --work-tree="$work" checkout "$ref" -- benchmarks utils
+            git --work-tree=/workspace checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
+                git --work-tree=/workspace checkout "$ref" -- benchmarks utils
 
             # Patch hf download to no-op (model is local on NFS)
             sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \\
-                "$work/benchmarks/single_node/{script}"
+                "/workspace/benchmarks/single_node/{script}"
 
             local result_file="verify-${{tag}}-{script.replace('.sh', '')}"
             set +e
-            cd "$work"
+            cd /workspace
 
             MODEL="{model_path}" \\
             TP="$tp" CONC="$conc" \\
@@ -122,14 +121,14 @@ def build_entrypoint(
             local rc=$?
             set -e
 
-            local result_json="$work/${{result_file}}.json"
+            local result_json="/workspace/${{result_file}}.json"
             local throughput="null"
             if [[ -f "$result_json" ]]; then
                 throughput=$(jq -r '.output_throughput // .total_token_throughput // .request_throughput // empty' "$result_json" || true)
             fi
 
             # Copy artifacts to NFS
-            cp -f "$work/server.log" "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
+            cp -f /workspace/server.log "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
             [[ -f "$result_json" ]] && cp -f "$result_json" "$NFS_DIR/${{result_file}}.json"
 
             # Append to summary
