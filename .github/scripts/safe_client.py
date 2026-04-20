@@ -85,7 +85,11 @@ class SaFEClient:
         if env_vars:
             payload["env"] = env_vars
 
+        log.info("POST %s payload keys: %s", url, list(payload.keys()))
+        log.info("workspaceId=%s, image=%s, gpu=%s", workspace_id, image, gpu_count)
         resp = self._session.post(url, json=payload, timeout=30)
+        if resp.status_code >= 400:
+            log.error("SaFE API error %d: %s", resp.status_code, resp.text[:2000])
         resp.raise_for_status()
         data = resp.json()
         wl_id = data.get("id") or data.get("workloadId", "")

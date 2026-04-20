@@ -161,6 +161,7 @@ jobs:
             --output-dir verify-results \
             --safe-api-key "$SAFE_API_KEY" \
             --safe-workspace-id "$SAFE_WORKSPACE_ID" \
+            --no-verify-ssl \
             --gpu-count 8 \
             --timeout 7200
 
