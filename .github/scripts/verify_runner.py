@@ -29,6 +29,9 @@ import time
 from pathlib import Path
 from textwrap import dedent
 
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 from safe_client import SaFEClient
 
 log = logging.getLogger("verify-runner")
@@ -65,7 +68,7 @@ def build_entrypoint(
         NFS_DIR="{nfs_result_dir}"
         mkdir -p "$NFS_DIR"
         POD_LOG="$NFS_DIR/pod.log"
-        exec > >(tee -a "$POD_LOG") 2>&1
+        exec > >(stdbuf -oL tee -a "$POD_LOG") 2>&1
 
         echo "=== SaFE verify-pr pod started at $(date -u) ==="
         echo "Script: {script}"

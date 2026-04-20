@@ -163,6 +163,8 @@ jobs:
             --safe-workspace-id "$SAFE_WORKSPACE_ID" \
             --no-verify-ssl \
             --gpu-count 8 \
+            --cpu 64 \
+            --memory 1024Gi \
             --timeout 7200
 
       - uses: actions/upload-artifact@v4
