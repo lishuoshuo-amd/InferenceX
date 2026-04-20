@@ -1,8 +1,10 @@
 name: Verify PR (Hyperloom)
 run-name: Verify PR - ${{ github.event.pull_request.title || github.sha }}
 
-# Triggered when an auto-PR from Hyperloom gets the sweep-enabled label
+# Triggered when an auto-PR from Hyperloom gets the `verify-enabled` label
 # (also re-runs on synchronize so PR updates re-verify automatically).
+# Distinct from upstream's `sweep-enabled` label so we don't accidentally
+# trigger run-sweep.yml (which can't run on fork without internal secrets).
 # Detects which mi355x bench scripts changed, then runs each script twice
 # inside its docker image (baseline=PR base ref, optimized=PR head ref) on
 # our self-hosted mi355x runner and posts a gain% table back to the PR.
@@ -20,7 +22,7 @@ concurrency:
 
 jobs:
   detect:
-    if: contains(github.event.pull_request.labels.*.name, 'sweep-enabled')
+    if: contains(github.event.pull_request.labels.*.name, 'verify-enabled')
     runs-on: ubuntu-latest
     outputs:
       scripts: ${{ steps.diff.outputs.scripts }}
@@ -31,11 +33,13 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install yq
+      - name: Install yq (no sudo, runner-local)
         run: |
-          sudo wget -qO /usr/local/bin/yq \
+          mkdir -p "$HOME/bin"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          wget -qO "$HOME/bin/yq" \
             https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-          sudo chmod +x /usr/local/bin/yq
+          chmod +x "$HOME/bin/yq"
 
       - id: diff
         env:
@@ -87,14 +91,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install yq + jq
+      - name: Install yq + jq (no sudo, runner-local)
         run: |
-          command -v yq || {
-            sudo wget -qO /usr/local/bin/yq \
+          mkdir -p "$HOME/bin"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          if ! command -v yq >/dev/null; then
+            wget -qO "$HOME/bin/yq" \
               https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
-            sudo chmod +x /usr/local/bin/yq
-          }
-          command -v jq || sudo apt-get install -y jq
+            chmod +x "$HOME/bin/yq"
+          fi
+          if ! command -v jq >/dev/null; then
+            wget -qO "$HOME/bin/jq" \
+              https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+            chmod +x "$HOME/bin/jq"
+          fi
 
       - name: Preflight check (docker / GPU / models)
         run: |
