@@ -226,6 +226,18 @@ def run(args: argparse.Namespace) -> int:
     )
     log.info("Workload %s finished: %s", workload_id, status)
 
+    # Dump pod log from NFS to CI stdout
+    pod_log = Path(nfs_result_dir) / "pod.log"
+    if pod_log.exists():
+        content = pod_log.read_text(errors="replace")
+        print(f"\n{'=' * 60}")
+        print(f"POD LOG ({args.script})")
+        print(f"{'=' * 60}")
+        print(content[-50000:] if len(content) > 50000 else content)
+        print(f"{'=' * 60}\n")
+    else:
+        log.warning("No pod.log found at %s", pod_log)
+
     # Collect results from NFS -> local output dir
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
