@@ -5,10 +5,11 @@ run-name: Verify PR - ${{ github.event.pull_request.title || github.sha }}
 # (also re-runs on synchronize so PR updates re-verify automatically).
 # Distinct from upstream's `sweep-enabled` label so we don't accidentally
 # trigger run-sweep.yml (which can't run on fork without internal secrets).
-# Detects which mi355x bench scripts changed, then runs each script twice
-# (baseline=PR base ref, optimized=PR head ref) inside its docker image on
-# our SaFE ARC runner scale set and posts a gain% table back to the PR.
-# Each changed script runs as an independent matrix job (max-parallel: 6).
+# Detects which mi355x bench scripts changed, then for each script expands
+# the full (tp, conc, isl, osl) search-space from amd-master.yaml and runs
+# baseline (PR base ref) + optimized (PR head ref) for every point inside
+# its docker image on the SaFE ARC runner scale set, posting a gain% table
+# back to the PR. Each changed script runs as an independent matrix job.
 
 on:
   pull_request:
@@ -26,23 +27,24 @@ jobs:
     if: contains(github.event.pull_request.labels.*.name, 'verify-enabled')
     runs-on: ubuntu-latest
     outputs:
-      scripts: ${{ steps.diff.outputs.scripts }}
-      count: ${{ steps.diff.outputs.count }}
+      scripts: ${{ steps.expand.outputs.scripts }}
+      count: ${{ steps.expand.outputs.count }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install yq (no sudo, runner-local)
+      - name: Install yq + pydantic (no sudo)
         run: |
           mkdir -p "$HOME/bin"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           wget -qO "$HOME/bin/yq" \
             https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
           chmod +x "$HOME/bin/yq"
+          pip install --quiet pydantic pyyaml
 
-      - id: diff
+      - id: expand
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -58,11 +60,29 @@ jobs:
             'benchmarks/single_node/*.sh' | xargs -n1 basename || true)
           echo "Changed scripts: ${CHANGED[*]:-<none>}"
 
-          # Intersect
+          # Intersect changed ∩ whitelist; emit one expanded JSON per script.
+          # The expanded payload contains every (tp, conc, isl, osl) point that
+          # upstream would run via amd-master.yaml — we use upstream's own
+          # generator script so we always stay aligned.
           MATCHED=()
+          declare -A SCRIPT_RUNS
           for s in "${CHANGED[@]:-}"; do
             for w in "${WHITELIST[@]}"; do
-              [[ "$s" == "$w" ]] && MATCHED+=("$s") && break
+              if [[ "$s" == "$w" ]]; then
+                key=$(yq -r ".scripts[\"$s\"].master_config_key" \
+                  .github/configs/hyperloom-verify.yaml)
+                runs=$(python3 utils/matrix_logic/generate_sweep_configs.py \
+                  test-config \
+                  --config-keys "$key" \
+                  --config-files .github/configs/amd-master.yaml \
+                  --no-evals \
+                  | jq -c '[.[] | {tp, conc, isl, osl}]')
+                npts=$(echo "$runs" | jq 'length')
+                echo "  $s ($key): $npts points"
+                MATCHED+=("$s")
+                SCRIPT_RUNS["$s"]="$runs"
+                break
+              fi
             done
           done
 
@@ -70,17 +90,23 @@ jobs:
             echo "scripts=[]" >> "$GITHUB_OUTPUT"
             echo "count=0" >> "$GITHUB_OUTPUT"
           else
-            JSON=$(printf '%s\n' "${MATCHED[@]}" | jq -R . | jq -sc .)
+            JSON='[]'
+            for s in "${MATCHED[@]}"; do
+              JSON=$(echo "$JSON" | jq -c \
+                --arg name "$s" \
+                --argjson runs "${SCRIPT_RUNS[$s]}" \
+                '. += [{name: $name, runs: $runs}]')
+            done
             echo "scripts=$JSON" >> "$GITHUB_OUTPUT"
             echo "count=${#MATCHED[@]}" >> "$GITHUB_OUTPUT"
           fi
-          echo "Matched: ${MATCHED[*]:-<none>}"
+          echo "Matched scripts: ${MATCHED[*]:-<none>}"
 
   verify:
     needs: detect
     if: needs.detect.outputs.count != '0'
     runs-on: inferencexfork-t25db
-    timeout-minutes: 600
+    timeout-minutes: 1440
     strategy:
       fail-fast: false
       max-parallel: 6
@@ -91,7 +117,8 @@ jobs:
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       MODELS_ROOT: /hyperloom/models
       RANDOM_RANGE_RATIO: "0.8"
-      SCRIPT: ${{ matrix.script }}
+      SCRIPT: ${{ matrix.script.name }}
+      RUNS_JSON: ${{ toJson(matrix.script.runs) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -119,28 +146,31 @@ jobs:
           ls /dev/kfd /dev/dri >/dev/null
           test -d "$MODELS_ROOT" || { echo "Missing $MODELS_ROOT"; exit 1; }
 
-      - name: Run baseline + optimized for ${{ matrix.script }}
+      - name: Run baseline + optimized for ${{ matrix.script.name }}
         run: |
           set -uo pipefail
           mkdir -p verify-results
           SUMMARY=verify-results/summary-${SCRIPT%.sh}.json
           echo '[]' > "$SUMMARY"
 
-          run_one() {
-            # $1=mode (baseline|optimized)  $2=ref
-            local mode=$1 ref=$2
-            local cfg=".github/configs/hyperloom-verify.yaml"
-            local image model tp conc isl osl mml
-            image=$(yq -r ".scripts[\"$SCRIPT\"].image" $cfg)
-            model=$(yq -r ".scripts[\"$SCRIPT\"].model_path" $cfg)
-            tp=$(yq -r ".scripts[\"$SCRIPT\"].tp" $cfg)
-            conc=$(yq -r ".scripts[\"$SCRIPT\"].conc" $cfg)
-            isl=$(yq -r ".scripts[\"$SCRIPT\"].isl" $cfg)
-            osl=$(yq -r ".scripts[\"$SCRIPT\"].osl" $cfg)
-            mml=$((isl + osl + 200))
+          cfg=".github/configs/hyperloom-verify.yaml"
+          IMAGE=$(yq -r ".scripts[\"$SCRIPT\"].image // \"\"" $cfg)
+          MODEL=$(yq -r ".scripts[\"$SCRIPT\"].model_path" $cfg)
+          KEY=$(yq -r ".scripts[\"$SCRIPT\"].master_config_key" $cfg)
+          # If image not pinned in lookup table, fetch it from amd-master.yaml
+          if [[ -z "$IMAGE" || "$IMAGE" == "null" ]]; then
+            IMAGE=$(yq -r ".[\"$KEY\"].image" .github/configs/amd-master.yaml)
+          fi
+          echo "Script: $SCRIPT  Key: $KEY  Image: $IMAGE  Model: $MODEL"
 
-            echo "::group::Run $mode @ $ref :: $SCRIPT"
-            local work="verify-results/${SCRIPT%.sh}_${mode}"
+          run_one() {
+            # $1=mode (baseline|optimized)  $2=ref  $3=tp  $4=conc  $5=isl  $6=osl
+            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6
+            local mml=$((isl + osl + 200))
+            local tag="${mode}-tp${tp}-conc${conc}-${isl}_${osl}"
+
+            echo "::group::Run $tag @ $ref :: $SCRIPT"
+            local work="verify-results/${SCRIPT%.sh}_${tag}"
             rm -rf "$work" && mkdir -p "$work"
             git --work-tree="$work" checkout "$ref" -- benchmarks utils runners 2>/dev/null || \
               git --work-tree="$work" checkout "$ref" -- benchmarks utils
@@ -148,9 +178,9 @@ jobs:
             sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \
               "$work/benchmarks/single_node/$SCRIPT"
 
-            docker pull "$image" || true
+            docker pull "$IMAGE" || true
 
-            local result_file="verify-${mode}-${SCRIPT%.sh}"
+            local result_file="verify-${tag}-${SCRIPT%.sh}"
             set +e
             docker run --rm \
               --device=/dev/kfd --device=/dev/dri --group-add video \
@@ -158,12 +188,12 @@ jobs:
               --network host --ipc host --shm-size 16g \
               -v "$PWD/$work":/workspace -w /workspace \
               -v "$MODELS_ROOT":"$MODELS_ROOT":ro \
-              -e MODEL="$model" -e TP="$tp" -e CONC="$conc" \
+              -e MODEL="$MODEL" -e TP="$tp" -e CONC="$conc" \
               -e ISL="$isl" -e OSL="$osl" -e MAX_MODEL_LEN="$mml" \
               -e RANDOM_RANGE_RATIO="$RANDOM_RANGE_RATIO" \
               -e RESULT_FILENAME="$result_file" \
               -e RUN_EVAL=false -e EVAL_ONLY=false -e EXP_NAME=verify \
-              "$image" \
+              "$IMAGE" \
               bash benchmarks/single_node/$SCRIPT
             local rc=$?
             set -e
@@ -173,22 +203,33 @@ jobs:
             if [[ -f "$json" ]]; then
               throughput=$(jq -r '.output_throughput // .total_token_throughput // .request_throughput // empty' "$json" || true)
             fi
-            cp -f "$work/server.log" "verify-results/${mode}-${SCRIPT%.sh}.server.log" 2>/dev/null || true
+            cp -f "$work/server.log" "verify-results/${tag}-${SCRIPT%.sh}.server.log" 2>/dev/null || true
             [[ -f "$json" ]] && cp -f "$json" "verify-results/${result_file}.json"
 
             jq --arg s "$SCRIPT" --arg m "$mode" --arg t "${throughput:-null}" \
-               --arg c "$conc" --arg i "$isl" --arg o "$osl" --arg rc "$rc" \
+               --arg tp "$tp" --arg c "$conc" --arg i "$isl" --arg o "$osl" --arg rc "$rc" \
                '. += [{script:$s, mode:$m, throughput:($t|tonumber? // null),
-                       conc:($c|tonumber), isl:($i|tonumber), osl:($o|tonumber),
+                       tp:($tp|tonumber), conc:($c|tonumber),
+                       isl:($i|tonumber), osl:($o|tonumber),
                        exit_code:($rc|tonumber)}]' \
                "$SUMMARY" > "$SUMMARY.tmp" && mv "$SUMMARY.tmp" "$SUMMARY"
 
-            docker ps -q --filter "ancestor=$image" | xargs -r docker rm -f >/dev/null 2>&1 || true
+            docker ps -q --filter "ancestor=$IMAGE" | xargs -r docker rm -f >/dev/null 2>&1 || true
             echo "::endgroup::"
           }
 
-          run_one baseline "$BASE_SHA"
-          run_one optimized "$HEAD_SHA"
+          NPTS=$(echo "$RUNS_JSON" | jq 'length')
+          echo "Will run $NPTS points (× 2 for baseline+optimized) for $SCRIPT"
+
+          for i in $(seq 0 $((NPTS - 1))); do
+            tp=$(echo "$RUNS_JSON" | jq -r ".[$i].tp")
+            conc=$(echo "$RUNS_JSON" | jq -r ".[$i].conc")
+            isl=$(echo "$RUNS_JSON" | jq -r ".[$i].isl")
+            osl=$(echo "$RUNS_JSON" | jq -r ".[$i].osl")
+            echo "─── point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ───"
+            run_one baseline  "$BASE_SHA" "$tp" "$conc" "$isl" "$osl"
+            run_one optimized "$HEAD_SHA" "$tp" "$conc" "$isl" "$osl"
+          done
 
           echo "=== summary for $SCRIPT ==="
           cat "$SUMMARY"
@@ -196,7 +237,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: verify-pr-results-${{ matrix.script }}
+          name: verify-pr-results-${{ matrix.script.name }}
           path: verify-results/
           retention-days: 30
 
@@ -232,33 +273,51 @@ jobs:
           else
             python3 - "${summaries[@]}" > "$BODY" <<'PY'
           import json, sys, pathlib
+          from collections import defaultdict
           rows = []
           for p in sys.argv[1:]:
               try:
                   rows.extend(json.loads(pathlib.Path(p).read_text()))
               except Exception as e:
                   print(f"<!-- failed to read {p}: {e} -->")
-          by_script = {}
+
+          # group by (script, tp, conc, isl, osl) → {baseline, optimized}
+          buckets = defaultdict(dict)
           for r in rows:
-              by_script.setdefault(r["script"], {})[r["mode"]] = r
+              key = (r["script"], r["tp"], r["conc"], r["isl"], r["osl"])
+              buckets[key][r["mode"]] = r
+
           print("### Verify PR (Hyperloom) — Unofficial smoke test\n")
-          print("> Only the upstream [InferenceX](https://github.com/SemiAnalysisAI/InferenceX) repo")
-          print("> contains the Official InferenceX result. This fork verify is an Unofficial smoke")
-          print("> test using a single (tp, conc) point per script; authoritative comparison runs")
-          print("> on upstream after PR is opened against SemiAnalysisAI/InferenceX.\n")
-          print("| Script | tp | conc | baseline (tok/s) | optimized (tok/s) | gain | verdict |")
-          print("|---|---|---|---|---|---|---|")
-          for s, modes in sorted(by_script.items()):
-              b = modes.get("baseline", {}); o = modes.get("optimized", {})
-              bt, ot = b.get("throughput"), o.get("throughput")
-              tp = "?"  # tp is in hyperloom-verify.yaml, not in summary; could enrich later
-              conc = b.get("conc") or o.get("conc")
-              if bt and ot:
-                  gain = (ot - bt) / bt * 100
-                  verdict = "OK" if gain >= -2.0 else "WARN: regression"
-                  print(f"| `{s}` | {tp} | {conc} | {bt:.2f} | {ot:.2f} | {gain:+.2f}% | {verdict} |")
-              else:
-                  print(f"| `{s}` | {tp} | {conc} | {bt or 'FAIL'} | {ot or 'FAIL'} | n/a | FAIL |")
+          print("> Only the upstream [InferenceX](https://github.com/SemiAnalysisAI/InferenceX)")
+          print("> repo contains the official benchmark of record. This fork verify reproduces")
+          print("> the full (tp, conc, isl, osl) search-space from `amd-master.yaml` for each")
+          print("> changed script, running both PR base and PR head; results below are a")
+          print("> smoke-test indicator. ±2% is treated as noise (verdict OK).\n")
+
+          # one table per script, sorted points inside
+          by_script = defaultdict(list)
+          for key, modes in buckets.items():
+              by_script[key[0]].append((key, modes))
+
+          for script in sorted(by_script):
+              print(f"#### `{script}`\n")
+              print("| isl/osl | tp | conc | baseline (tok/s) | optimized (tok/s) | gain | verdict |")
+              print("|---|---|---|---|---|---|---|")
+              entries = sorted(
+                  by_script[script],
+                  key=lambda kv: (kv[0][3], kv[0][4], kv[0][1], kv[0][2]),
+              )
+              for (s, tp, conc, isl, osl), modes in entries:
+                  b = modes.get("baseline", {}); o = modes.get("optimized", {})
+                  bt, ot = b.get("throughput"), o.get("throughput")
+                  isl_osl = f"{isl//1024}k{osl//1024}k" if isl % 1024 == 0 and osl % 1024 == 0 else f"{isl}/{osl}"
+                  if bt and ot:
+                      gain = (ot - bt) / bt * 100
+                      verdict = "OK" if gain >= -2.0 else "WARN: regression"
+                      print(f"| {isl_osl} | {tp} | {conc} | {bt:.2f} | {ot:.2f} | {gain:+.2f}% | {verdict} |")
+                  else:
+                      print(f"| {isl_osl} | {tp} | {conc} | {bt or 'FAIL'} | {ot or 'FAIL'} | n/a | FAIL |")
+              print()
           PY
           fi
 
