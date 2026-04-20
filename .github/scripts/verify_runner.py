@@ -95,7 +95,7 @@ def build_entrypoint(
         echo "Will run $NPTS points (x2 for baseline+optimized) for {script}"
 
         run_one() {{
-            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6
+            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6 ep=${{7:-1}}
             local mml=$((isl + osl + 200))
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
@@ -115,7 +115,7 @@ def build_entrypoint(
             cd /workspace
 
             MODEL="{model_path}" \\
-            TP="$tp" CONC="$conc" \\
+            TP="$tp" CONC="$conc" EP_SIZE="$ep" \\
             ISL="$isl" OSL="$osl" MAX_MODEL_LEN="$mml" \\
             RANDOM_RANGE_RATIO="{random_range_ratio}" \\
             RESULT_FILENAME="$result_file" \\
@@ -151,9 +151,10 @@ def build_entrypoint(
             conc=$(echo "$RUNS_JSON" | jq -r ".[$i].conc")
             isl=$(echo "$RUNS_JSON" | jq -r ".[$i].isl")
             osl=$(echo "$RUNS_JSON" | jq -r ".[$i].osl")
-            echo "=== point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ==="
-            run_one baseline  "{base_sha}" "$tp" "$conc" "$isl" "$osl"
-            run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl"
+            ep=$(echo "$RUNS_JSON" | jq -r ".[$i].ep // 1")
+            echo "=== point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ep=$ep ==="
+            run_one baseline  "{base_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
+            run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
         done
 
         echo ""

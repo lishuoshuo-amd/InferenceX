@@ -67,7 +67,7 @@ jobs:
                   --config-keys "$key" \
                   --config-files .github/configs/amd-master.yaml \
                   --no-evals \
-                  | jq -c '[.[] | {tp, conc, isl, osl}]')
+                  | jq -c '[.[] | {tp, conc, isl, osl, ep: (.ep // 1)}]')
                 npts=$(echo "$runs" | jq 'length')
                 echo "  $s ($key): $npts points"
                 MATCHED+=("$s")
