@@ -87,7 +87,7 @@ def build_entrypoint(
         SUMMARY="$NFS_DIR/summary-{script.replace('.sh', '')}.json"
         echo '[]' > "$SUMMARY"
 
-        # Clone repo (full history for checkout of base/head refs)
+        # Clone repo with full history; fetch upstream if base SHA missing (fork PR)
         REPO_DIR="/tmp/inferencex-repo"
         rm -rf "$REPO_DIR"
         if ! git clone --quiet {repo_url} "$REPO_DIR"; then
@@ -95,8 +95,18 @@ def build_entrypoint(
             exit 1
         fi
         cd "$REPO_DIR"
-        if ! git cat-file -e "{base_sha}" 2>/dev/null || ! git cat-file -e "{head_sha}" 2>/dev/null; then
-            echo "FATAL: base ({base_sha[:10]}) or head ({head_sha[:10]}) SHA not found in repo" >&2
+        # Fetch base SHA from upstream if not in fork history
+        if ! git cat-file -e "{base_sha}" 2>/dev/null; then
+            echo "Base SHA not in clone, fetching from upstream..."
+            git fetch --quiet origin "{base_sha}" 2>/dev/null || \
+            git fetch --quiet https://github.com/SemiAnalysisAI/InferenceX.git "{base_sha}" 2>/dev/null || true
+        fi
+        if ! git cat-file -e "{base_sha}" 2>/dev/null; then
+            echo "FATAL: base SHA {base_sha[:10]} not found" >&2
+            exit 1
+        fi
+        if ! git cat-file -e "{head_sha}" 2>/dev/null; then
+            echo "FATAL: head SHA {head_sha[:10]} not found" >&2
             exit 1
         fi
 
@@ -324,18 +334,52 @@ def run(args: argparse.Namespace) -> int:
         local_summary.write_text("[]")
         return 1
 
-    # Validate results quality
+    # Validate results: every (tp, conc, isl, osl) must have both baseline + optimized
     import json as _json
+    from collections import defaultdict
     results = _json.loads(local_summary.read_text())
     total = len(results)
     ok = sum(1 for r in results if r.get("throughput") and r["throughput"] > 0)
     fail = total - ok
     log.info("Results: %d total, %d ok, %d failed", total, ok, fail)
+
     if total == 0:
         log.error("No benchmark results produced")
         return 1
-    if ok == 0:
-        log.error("All %d benchmark points failed", total)
+
+    expected_points = len(args.runs) * 2  # baseline + optimized per point
+    if total < expected_points:
+        log.warning("Incomplete: %d/%d results (pod may have been killed early)",
+                     total, expected_points)
+
+    # Check paired completeness
+    buckets = defaultdict(dict)
+    for r in results:
+        key = (r["tp"], r["conc"], r["isl"], r["osl"])
+        buckets[key][r["mode"]] = r
+
+    paired_ok = 0
+    paired_fail = 0
+    for key, modes in buckets.items():
+        b = modes.get("baseline", {})
+        o = modes.get("optimized", {})
+        bt = b.get("throughput") if b else None
+        ot = o.get("throughput") if o else None
+        if bt and bt > 0 and ot and ot > 0:
+            paired_ok += 1
+        else:
+            paired_fail += 1
+            missing = []
+            if not bt or bt == 0: missing.append("baseline")
+            if not ot or ot == 0: missing.append("optimized")
+            log.warning("Incomplete pair tp=%s conc=%s isl=%s osl=%s: missing %s",
+                        key[0], key[1], key[2], key[3], "+".join(missing))
+
+    log.info("Paired results: %d complete / %d incomplete out of %d points",
+             paired_ok, paired_fail, len(buckets))
+
+    if paired_ok == 0:
+        log.error("No complete baseline+optimized pairs — verify cannot proceed")
         return 1
 
     if status != "completed":
