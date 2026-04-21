@@ -14,6 +14,9 @@ on:
     paths:
       - "benchmarks/single_node/*mi355x*.sh"
       - "benchmarks/benchmark_lib.sh"
+      - ".github/scripts/**"
+      - ".github/configs/hyperloom-verify.yaml"
+      - ".github/workflows/verify-pr.yml"
 
 concurrency:
   group: verify-pr-${{ github.event.pull_request.number }}
@@ -54,6 +57,15 @@ jobs:
           mapfile -t CHANGED < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
             'benchmarks/single_node/*.sh' | xargs -n1 basename || true)
           echo "Changed scripts: ${CHANGED[*]:-<none>}"
+
+          # If infra files changed, verify ALL whitelisted scripts
+          INFRA_CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            'benchmarks/benchmark_lib.sh' '.github/scripts/**' \
+            '.github/configs/hyperloom-verify.yaml' '.github/workflows/verify-pr.yml' || true)
+          if [[ -n "$INFRA_CHANGED" && ${#CHANGED[@]} -eq 0 ]]; then
+            echo "Infra files changed, verifying all whitelisted scripts"
+            CHANGED=("${WHITELIST[@]}")
+          fi
 
           MATCHED=()
           declare -A SCRIPT_RUNS

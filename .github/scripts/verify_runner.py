@@ -90,8 +90,15 @@ def build_entrypoint(
         # Clone repo (full history for checkout of base/head refs)
         REPO_DIR="/tmp/inferencex-repo"
         rm -rf "$REPO_DIR"
-        git clone --quiet {repo_url} "$REPO_DIR"
+        if ! git clone --quiet {repo_url} "$REPO_DIR"; then
+            echo "FATAL: git clone failed" >&2
+            exit 1
+        fi
         cd "$REPO_DIR"
+        if ! git cat-file -e "{base_sha}" 2>/dev/null || ! git cat-file -e "{head_sha}" 2>/dev/null; then
+            echo "FATAL: base ({base_sha[:10]}) or head ({head_sha[:10]}) SHA not found in repo" >&2
+            exit 1
+        fi
 
         RUNS_JSON='{runs_json_str}'
         NPTS=$(echo "$RUNS_JSON" | jq 'length')
@@ -103,13 +110,16 @@ def build_entrypoint(
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
             echo "--- Run $tag @ $ref ---"
-            # Kill residual server processes + free port from previous run
-            pkill -f "sglang.launch_server" 2>/dev/null || true
-            pkill -f "vllm serve" 2>/dev/null || true
-            pkill -f "benchmark_serving" 2>/dev/null || true
+            # Kill ALL residual server/worker processes (SIGKILL for reliability)
+            pkill -9 -f "sglang.launch_server" 2>/dev/null || true
+            pkill -9 -f "sglang.srt" 2>/dev/null || true
+            pkill -9 -f "vllm serve" 2>/dev/null || true
+            pkill -9 -f "vllm.entrypoints" 2>/dev/null || true
+            pkill -9 -f "benchmark_serving" 2>/dev/null || true
+            pkill -9 -f "ray::" 2>/dev/null || true
+            sleep 5
+            fuser -k -9 8888/tcp 2>/dev/null || true
             sleep 2
-            # Force kill any stubborn processes on port 8888
-            fuser -k 8888/tcp 2>/dev/null || true
             rm -rf /workspace && mkdir -p /workspace
 
             cd "$REPO_DIR"
@@ -294,8 +304,8 @@ def run(args: argparse.Namespace) -> int:
     nfs_summary = Path(nfs_result_dir) / summary_name
     local_summary = output_dir / summary_name
 
+    import shutil
     if nfs_summary.exists():
-        import shutil
         shutil.copy2(nfs_summary, local_summary)
         log.info("Summary copied: %s -> %s", nfs_summary, local_summary)
 
@@ -305,8 +315,23 @@ def run(args: argparse.Namespace) -> int:
         for f in Path(nfs_result_dir).glob("*.server.log"):
             shutil.copy2(f, output_dir / f.name)
     else:
-        log.warning("Summary not found at %s", nfs_summary)
+        log.error("Summary not found at %s — pod likely crashed before any benchmark ran", nfs_summary)
         local_summary.write_text("[]")
+        return 1
+
+    # Validate results quality
+    import json as _json
+    results = _json.loads(local_summary.read_text())
+    total = len(results)
+    ok = sum(1 for r in results if r.get("throughput") and r["throughput"] > 0)
+    fail = total - ok
+    log.info("Results: %d total, %d ok, %d failed", total, ok, fail)
+    if total == 0:
+        log.error("No benchmark results produced")
+        return 1
+    if ok == 0:
+        log.error("All %d benchmark points failed", total)
+        return 1
 
     if status != "completed":
         log.error("Workload did not complete successfully: %s", status)
