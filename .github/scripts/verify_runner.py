@@ -213,7 +213,11 @@ def run(args: argparse.Namespace) -> int:
     nfs_result_dir = args.nfs_result_dir
     import shutil
     if os.path.exists(nfs_result_dir):
-        shutil.rmtree(nfs_result_dir)
+        shutil.rmtree(nfs_result_dir, ignore_errors=True)
+        # NFS may leave .nfs* stale handles; retry after short delay
+        if os.path.exists(nfs_result_dir):
+            time.sleep(2)
+            shutil.rmtree(nfs_result_dir, ignore_errors=True)
     os.makedirs(nfs_result_dir, exist_ok=True)
 
     entrypoint = build_entrypoint(
