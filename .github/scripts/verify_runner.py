@@ -23,10 +23,14 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from textwrap import dedent
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from safe_client import SaFEClient
 
@@ -61,6 +65,11 @@ def build_entrypoint(
         #!/bin/bash
         set -uo pipefail
 
+        NFS_DIR="{nfs_result_dir}"
+        mkdir -p "$NFS_DIR"
+        POD_LOG="$NFS_DIR/pod.log"
+        exec > >(stdbuf -oL tee -a "$POD_LOG") 2>&1
+
         echo "=== SaFE verify-pr pod started at $(date -u) ==="
         echo "Script: {script}"
         echo "Points: {len(runs)}"
@@ -75,44 +84,73 @@ def build_entrypoint(
             apt-get update -qq && apt-get install -y -qq git || true
         fi
 
-        NFS_DIR="{nfs_result_dir}"
-        mkdir -p "$NFS_DIR"
         SUMMARY="$NFS_DIR/summary-{script.replace('.sh', '')}.json"
         echo '[]' > "$SUMMARY"
 
-        # Clone repo (full history for checkout of base/head refs)
+        # Clone repo with full history; fetch upstream if base SHA missing (fork PR)
         REPO_DIR="/tmp/inferencex-repo"
         rm -rf "$REPO_DIR"
-        git clone --quiet {repo_url} "$REPO_DIR"
+        if ! git clone --quiet {repo_url} "$REPO_DIR"; then
+            echo "FATAL: git clone failed" >&2
+            exit 1
+        fi
         cd "$REPO_DIR"
+        # Fetch base SHA from upstream if not in fork history
+        if ! git cat-file -e "{base_sha}" 2>/dev/null; then
+            echo "Base SHA not in clone, fetching from upstream..."
+            git fetch --quiet origin "{base_sha}" 2>/dev/null || \
+            git fetch --quiet https://github.com/SemiAnalysisAI/InferenceX.git "{base_sha}" 2>/dev/null || true
+        fi
+        if ! git cat-file -e "{base_sha}" 2>/dev/null; then
+            echo "FATAL: base SHA {base_sha[:10]} not found" >&2
+            exit 1
+        fi
+        if ! git cat-file -e "{head_sha}" 2>/dev/null; then
+            echo "FATAL: head SHA {head_sha[:10]} not found" >&2
+            exit 1
+        fi
 
         RUNS_JSON='{runs_json_str}'
         NPTS=$(echo "$RUNS_JSON" | jq 'length')
         echo "Will run $NPTS points (x2 for baseline+optimized) for {script}"
 
         run_one() {{
-            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6
+            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6 ep=${{7:-1}}
             local mml=$((isl + osl + 200))
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
             echo "--- Run $tag @ $ref ---"
-            local work="/tmp/work_${{tag}}"
-            rm -rf "$work" && mkdir -p "$work"
+            # Graceful stop (SIGTERM) then force kill (SIGKILL) as fallback
+            pkill -f "sglang.launch_server" 2>/dev/null || true
+            pkill -f "sglang.srt" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "vllm.entrypoints" 2>/dev/null || true
+            pkill -f "benchmark_serving" 2>/dev/null || true
+            pkill -f "ray::" 2>/dev/null || true
+            sleep 8
+            # Force kill anything still alive
+            pkill -9 -f "sglang" 2>/dev/null || true
+            pkill -9 -f "vllm" 2>/dev/null || true
+            sleep 2
+            fuser -k 8888/tcp 2>/dev/null || true
+            # Clean up leaked shared memory
+            rm -f /dev/shm/vllm_* /dev/shm/sglang_* 2>/dev/null || true
+            rm -rf /workspace && mkdir -p /workspace
 
             cd "$REPO_DIR"
-            git --work-tree="$work" checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
-                git --work-tree="$work" checkout "$ref" -- benchmarks utils
+            git --work-tree=/workspace checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
+                git --work-tree=/workspace checkout "$ref" -- benchmarks utils
 
             # Patch hf download to no-op (model is local on NFS)
             sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \\
-                "$work/benchmarks/single_node/{script}"
+                "/workspace/benchmarks/single_node/{script}"
 
             local result_file="verify-${{tag}}-{script.replace('.sh', '')}"
             set +e
-            cd "$work"
+            cd /workspace
 
             MODEL="{model_path}" \\
-            TP="$tp" CONC="$conc" \\
+            TP="$tp" CONC="$conc" EP_SIZE="$ep" \\
             ISL="$isl" OSL="$osl" MAX_MODEL_LEN="$mml" \\
             RANDOM_RANGE_RATIO="{random_range_ratio}" \\
             RESULT_FILENAME="$result_file" \\
@@ -121,14 +159,14 @@ def build_entrypoint(
             local rc=$?
             set -e
 
-            local result_json="$work/${{result_file}}.json"
+            local result_json="/workspace/${{result_file}}.json"
             local throughput="null"
             if [[ -f "$result_json" ]]; then
                 throughput=$(jq -r '.output_throughput // .total_token_throughput // .request_throughput // empty' "$result_json" || true)
             fi
 
             # Copy artifacts to NFS
-            cp -f "$work/server.log" "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
+            cp -f /workspace/server.log "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
             [[ -f "$result_json" ]] && cp -f "$result_json" "$NFS_DIR/${{result_file}}.json"
 
             # Append to summary
@@ -148,9 +186,10 @@ def build_entrypoint(
             conc=$(echo "$RUNS_JSON" | jq -r ".[$i].conc")
             isl=$(echo "$RUNS_JSON" | jq -r ".[$i].isl")
             osl=$(echo "$RUNS_JSON" | jq -r ".[$i].osl")
-            echo "=== point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ==="
-            run_one baseline  "{base_sha}" "$tp" "$conc" "$isl" "$osl"
-            run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl"
+            ep=$(echo "$RUNS_JSON" | jq -r ".[$i].ep // 1")
+            echo "=== point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ep=$ep ==="
+            run_one baseline  "{base_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
+            run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
         done
 
         echo ""
@@ -172,6 +211,13 @@ def run(args: argparse.Namespace) -> int:
     )
 
     nfs_result_dir = args.nfs_result_dir
+    import shutil
+    if os.path.exists(nfs_result_dir):
+        shutil.rmtree(nfs_result_dir, ignore_errors=True)
+        # NFS may leave .nfs* stale handles; retry after short delay
+        if os.path.exists(nfs_result_dir):
+            time.sleep(2)
+            shutil.rmtree(nfs_result_dir, ignore_errors=True)
     os.makedirs(nfs_result_dir, exist_ok=True)
 
     entrypoint = build_entrypoint(
@@ -188,7 +234,8 @@ def run(args: argparse.Namespace) -> int:
     )
 
     script_stem = args.script.replace(".sh", "")
-    workload_name = f"verify-{script_stem}-{args.head_sha[:8]}"
+    safe_name = re.sub(r"[^a-z0-9-]", "-", script_stem.lower()).strip("-")
+    workload_name = f"vpr-{safe_name}-{args.head_sha[:8]}"[:44]
 
     log.info("Creating SaFE workload: %s", workload_name)
     workload = client.create_workload(
@@ -211,12 +258,61 @@ def run(args: argparse.Namespace) -> int:
 
     log.info("Workload submitted: %s", workload_id)
 
-    status = client.poll_until_done(
-        workload_id,
-        timeout=args.timeout,
-        interval=30,
-        heartbeat_interval=300,
-    )
+    # Poll with live log tailing from NFS
+    pod_log_path = Path(nfs_result_dir) / "pod.log"
+    log_offset = 0
+    start = time.time()
+    status = "running"
+
+    while True:
+        elapsed = time.time() - start
+        if elapsed > args.timeout:
+            log.warning("Timeout after %ds, stopping workload", args.timeout)
+            client.stop_workload(workload_id)
+            status = "timeout"
+            break
+
+        try:
+            wl_status, wl_phase = client.get_workload_status(workload_id)
+        except Exception as e:
+            log.warning("Poll error: %s", e)
+            time.sleep(30)
+            continue
+
+        # Stream pod.log incremental content
+        if pod_log_path.exists():
+            try:
+                with open(pod_log_path, "r", errors="replace") as f:
+                    f.seek(log_offset)
+                    new_content = f.read()
+                    if new_content:
+                        print(new_content, end="", flush=True)
+                        log_offset += len(new_content)
+            except Exception:
+                pass
+
+        if wl_phase in ("succeeded", "completed") or wl_status in ("succeeded", "completed"):
+            log.info("Workload %s completed (%.0fs)", workload_id, elapsed)
+            status = "completed"
+            break
+        if wl_phase == "failed" or wl_status == "failed":
+            log.error("Workload %s failed (%.0fs)", workload_id, elapsed)
+            status = "failed"
+            break
+
+        time.sleep(30)
+
+    # Final flush of pod log
+    if pod_log_path.exists():
+        try:
+            with open(pod_log_path, "r", errors="replace") as f:
+                f.seek(log_offset)
+                remaining = f.read()
+                if remaining:
+                    print(remaining, end="", flush=True)
+        except Exception:
+            pass
+
     log.info("Workload %s finished: %s", workload_id, status)
 
     # Collect results from NFS -> local output dir
@@ -227,8 +323,8 @@ def run(args: argparse.Namespace) -> int:
     nfs_summary = Path(nfs_result_dir) / summary_name
     local_summary = output_dir / summary_name
 
+    import shutil
     if nfs_summary.exists():
-        import shutil
         shutil.copy2(nfs_summary, local_summary)
         log.info("Summary copied: %s -> %s", nfs_summary, local_summary)
 
@@ -238,8 +334,57 @@ def run(args: argparse.Namespace) -> int:
         for f in Path(nfs_result_dir).glob("*.server.log"):
             shutil.copy2(f, output_dir / f.name)
     else:
-        log.warning("Summary not found at %s", nfs_summary)
+        log.error("Summary not found at %s — pod likely crashed before any benchmark ran", nfs_summary)
         local_summary.write_text("[]")
+        return 1
+
+    # Validate results: every (tp, conc, isl, osl) must have both baseline + optimized
+    import json as _json
+    from collections import defaultdict
+    results = _json.loads(local_summary.read_text())
+    total = len(results)
+    ok = sum(1 for r in results if r.get("throughput") and r["throughput"] > 0)
+    fail = total - ok
+    log.info("Results: %d total, %d ok, %d failed", total, ok, fail)
+
+    if total == 0:
+        log.error("No benchmark results produced")
+        return 1
+
+    expected_points = len(args.runs) * 2  # baseline + optimized per point
+    if total < expected_points:
+        log.warning("Incomplete: %d/%d results (pod may have been killed early)",
+                     total, expected_points)
+
+    # Check paired completeness
+    buckets = defaultdict(dict)
+    for r in results:
+        key = (r["tp"], r["conc"], r["isl"], r["osl"])
+        buckets[key][r["mode"]] = r
+
+    paired_ok = 0
+    paired_fail = 0
+    for key, modes in buckets.items():
+        b = modes.get("baseline", {})
+        o = modes.get("optimized", {})
+        bt = b.get("throughput") if b else None
+        ot = o.get("throughput") if o else None
+        if bt and bt > 0 and ot and ot > 0:
+            paired_ok += 1
+        else:
+            paired_fail += 1
+            missing = []
+            if not bt or bt == 0: missing.append("baseline")
+            if not ot or ot == 0: missing.append("optimized")
+            log.warning("Incomplete pair tp=%s conc=%s isl=%s osl=%s: missing %s",
+                        key[0], key[1], key[2], key[3], "+".join(missing))
+
+    log.info("Paired results: %d complete / %d incomplete out of %d points",
+             paired_ok, paired_fail, len(buckets))
+
+    if paired_ok == 0:
+        log.error("No complete baseline+optimized pairs — verify cannot proceed")
+        return 1
 
     if status != "completed":
         log.error("Workload did not complete successfully: %s", status)

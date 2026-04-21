@@ -14,6 +14,9 @@ on:
     paths:
       - "benchmarks/single_node/*mi355x*.sh"
       - "benchmarks/benchmark_lib.sh"
+      - ".github/scripts/**"
+      - ".github/configs/hyperloom-verify.yaml"
+      - ".github/workflows/verify-pr.yml"
 
 concurrency:
   group: verify-pr-${{ github.event.pull_request.number }}
@@ -55,6 +58,15 @@ jobs:
             'benchmarks/single_node/*.sh' | xargs -n1 basename || true)
           echo "Changed scripts: ${CHANGED[*]:-<none>}"
 
+          # If infra files changed, verify ALL whitelisted scripts
+          INFRA_CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- \
+            'benchmarks/benchmark_lib.sh' '.github/scripts/**' \
+            '.github/configs/hyperloom-verify.yaml' '.github/workflows/verify-pr.yml' || true)
+          if [[ -n "$INFRA_CHANGED" && ${#CHANGED[@]} -eq 0 ]]; then
+            echo "Infra files changed, verifying all whitelisted scripts"
+            CHANGED=("${WHITELIST[@]}")
+          fi
+
           MATCHED=()
           declare -A SCRIPT_RUNS
           for s in "${CHANGED[@]:-}"; do
@@ -67,7 +79,7 @@ jobs:
                   --config-keys "$key" \
                   --config-files .github/configs/amd-master.yaml \
                   --no-evals \
-                  | jq -c '[.[] | {tp, conc, isl, osl}]')
+                  | jq -c '[.[] | {tp, conc, isl, osl, ep: (.ep // 1)}]')
                 npts=$(echo "$runs" | jq 'length')
                 echo "  $s ($key): $npts points"
                 MATCHED+=("$s")
@@ -122,7 +134,7 @@ jobs:
           mkdir -p "$HOME/bin"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           if ! command -v yq >/dev/null; then
-            wget -qO "$HOME/bin/yq" \
+            curl -fsSL -o "$HOME/bin/yq" \
               https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
             chmod +x "$HOME/bin/yq"
           fi
@@ -161,8 +173,11 @@ jobs:
             --output-dir verify-results \
             --safe-api-key "$SAFE_API_KEY" \
             --safe-workspace-id "$SAFE_WORKSPACE_ID" \
+            --no-verify-ssl \
             --gpu-count 8 \
-            --timeout 7200
+            --cpu 64 \
+            --memory 1024Gi \
+            --timeout 54000
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -250,3 +265,104 @@ jobs:
           fi
 
           gh pr comment "$PR" --repo "$REPO" --body-file "$BODY"
+
+      - name: Send Teams webhook notification
+        if: env.TEAMS_WEBHOOK_URL != ''
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          pip install --quiet requests 2>/dev/null || true
+          python3 - <<'TEAMS'
+          import json, os, sys, time, requests
+          from collections import defaultdict
+          from pathlib import Path
+
+          webhook = os.environ.get("TEAMS_WEBHOOK_URL", "")
+          if not webhook:
+              print("TEAMS_WEBHOOK_URL not set, skipping")
+              sys.exit(0)
+
+          pr_num = os.environ.get("PR_NUMBER", "?")
+          pr_title = os.environ.get("PR_TITLE", "")
+          pr_url = os.environ.get("PR_URL", "")
+
+          summaries = sorted(Path("all-results").glob("summary-*.json"))
+          if not summaries:
+              print("No summaries found, skipping webhook")
+              sys.exit(0)
+
+          all_rows = []
+          for p in summaries:
+              try:
+                  all_rows.extend(json.loads(p.read_text()))
+              except Exception:
+                  pass
+
+          buckets = defaultdict(dict)
+          for r in all_rows:
+              key = (r["script"], r["tp"], r["conc"], r["isl"], r["osl"])
+              buckets[key][r["mode"]] = r
+
+          by_script = defaultdict(list)
+          for key, modes in buckets.items():
+              by_script[key[0]].append((key, modes))
+
+          # Send one card per model
+          for script in sorted(by_script):
+              pairs = by_script[script]
+              complete = [(k, m) for k, m in pairs
+                          if m.get("baseline", {}).get("throughput") and m["baseline"]["throughput"] > 0
+                          and m.get("optimized", {}).get("throughput") and m["optimized"]["throughput"] > 0]
+              total_pairs = len(pairs)
+              gains = [(m["optimized"]["throughput"] - m["baseline"]["throughput"]) / m["baseline"]["throughput"] * 100
+                       for k, m in complete]
+              avg_gain = sum(gains) / len(gains) if gains else 0
+              icon = "\u2705" if avg_gain >= -2.0 else "\u26a0\ufe0f"
+              short = script.replace(".sh", "")
+
+              header = ["ISL/OSL", "TP", "Conc", "Baseline", "Optimized", "Gain"]
+              detail_rows = [{"type": "TableRow", "style": "accent", "cells": [
+                  {"type": "TableCell", "items": [{"type": "TextBlock", "text": c, "weight": "Bolder", "size": "Small"}]}
+                  for c in header
+              ]}]
+
+              for (s, tp, conc, isl, osl), modes in sorted(complete, key=lambda x: (x[0][3], x[0][4], x[0][1], x[0][2])):
+                  bt = modes["baseline"]["throughput"]
+                  ot = modes["optimized"]["throughput"]
+                  gain = (ot - bt) / bt * 100
+                  isl_s = f"{isl//1024}k/{osl//1024}k" if isl % 1024 == 0 and osl % 1024 == 0 else f"{isl}/{osl}"
+                  gc = "Good" if gain > 0 else "Attention" if gain < -2 else "Default"
+                  detail_rows.append({"type": "TableRow", "cells": [
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": isl_s, "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(tp), "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(conc), "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{bt:.0f}", "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{ot:.0f}", "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{gain:+.1f}%", "size": "Small", "color": gc, "weight": "Bolder"}]},
+                  ]})
+
+              body = [
+                  {"type": "TextBlock", "weight": "Bolder", "size": "Medium",
+                   "text": f"{icon} PR#{pr_num} Verify: {short}"},
+                  {"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
+                   "text": f"Avg Gain: {avg_gain:+.1f}% | {len(complete)}/{total_pairs} pairs"},
+                  {"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
+                   "columns": [{"width": 1}] * 6, "rows": detail_rows},
+              ]
+
+              card = {"type": "message", "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "type": "AdaptiveCard", "version": "1.5", "body": body,
+                  "actions": [{"type": "Action.OpenUrl", "title": "View PR", "url": pr_url}],
+              }}]}
+
+              try:
+                  resp = requests.post(webhook, json=card, timeout=15)
+                  print(f"{short}: {resp.status_code}")
+              except Exception as e:
+                  print(f"{short}: webhook failed: {e}")
+              time.sleep(5)
+          TEAMS

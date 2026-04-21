@@ -23,7 +23,7 @@ scripts:
     master_config_key: qwen3.5-bf16-mi355x-sglang
 
   glm5_fp8_mi355x.sh:
-    model_path: /hyperloom/models/zai-org-GLM-5-FP8
+    model_path: /hyperloom/models/GLM-5-FP8
     master_config_key: glm5-fp8-mi355x-sglang
 
   kimik2.5_int4_mi355x.sh:

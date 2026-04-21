@@ -44,8 +44,8 @@ class SaFEClient:
         image: str,
         command: str,
         gpu_count: int = 8,
-        cpu: int = 4,
-        memory: str = "128Gi",
+        cpu: int = 64,
+        memory: str = "1024Gi",
         ephemeral_storage: str = "100Gi",
         replicas: int = 1,
         rdma: str = "1k",
@@ -79,13 +79,17 @@ class SaFEClient:
             "entryPoints": [entry_point],
             "priority": 1,
             "maxRetry": 0,
-            "ttlSecondsAfterFinished": 0,
+            "ttlSecondsAfterFinished": 600,
             "forceHostNetwork": force_host_network,
         }
         if env_vars:
             payload["env"] = env_vars
 
+        log.info("POST %s payload keys: %s", url, list(payload.keys()))
+        log.info("workspaceId=%s, image=%s, gpu=%s", workspace_id, image, gpu_count)
         resp = self._session.post(url, json=payload, timeout=30)
+        if resp.status_code >= 400:
+            log.error("SaFE API error %d: %s", resp.status_code, resp.text[:2000])
         resp.raise_for_status()
         data = resp.json()
         wl_id = data.get("id") or data.get("workloadId", "")
