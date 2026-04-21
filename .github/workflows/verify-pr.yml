@@ -165,7 +165,7 @@ jobs:
             --gpu-count 8 \
             --cpu 64 \
             --memory 1024Gi \
-            --timeout 7200
+            --timeout 28800
 
       - uses: actions/upload-artifact@v4
         if: always()

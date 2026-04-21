@@ -103,6 +103,13 @@ def build_entrypoint(
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
             echo "--- Run $tag @ $ref ---"
+            # Kill residual server processes + free port from previous run
+            pkill -f "sglang.launch_server" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "benchmark_serving" 2>/dev/null || true
+            sleep 2
+            # Force kill any stubborn processes on port 8888
+            fuser -k 8888/tcp 2>/dev/null || true
             rm -rf /workspace && mkdir -p /workspace
 
             cd "$REPO_DIR"
