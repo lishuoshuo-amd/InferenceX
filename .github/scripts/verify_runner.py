@@ -110,16 +110,21 @@ def build_entrypoint(
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
             echo "--- Run $tag @ $ref ---"
-            # Kill ALL residual server/worker processes (SIGKILL for reliability)
-            pkill -9 -f "sglang.launch_server" 2>/dev/null || true
-            pkill -9 -f "sglang.srt" 2>/dev/null || true
-            pkill -9 -f "vllm serve" 2>/dev/null || true
-            pkill -9 -f "vllm.entrypoints" 2>/dev/null || true
-            pkill -9 -f "benchmark_serving" 2>/dev/null || true
-            pkill -9 -f "ray::" 2>/dev/null || true
-            sleep 5
-            fuser -k -9 8888/tcp 2>/dev/null || true
+            # Graceful stop (SIGTERM) then force kill (SIGKILL) as fallback
+            pkill -f "sglang.launch_server" 2>/dev/null || true
+            pkill -f "sglang.srt" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "vllm.entrypoints" 2>/dev/null || true
+            pkill -f "benchmark_serving" 2>/dev/null || true
+            pkill -f "ray::" 2>/dev/null || true
+            sleep 8
+            # Force kill anything still alive
+            pkill -9 -f "sglang" 2>/dev/null || true
+            pkill -9 -f "vllm" 2>/dev/null || true
             sleep 2
+            fuser -k 8888/tcp 2>/dev/null || true
+            # Clean up leaked shared memory
+            rm -f /dev/shm/vllm_* /dev/shm/sglang_* 2>/dev/null || true
             rm -rf /workspace && mkdir -p /workspace
 
             cd "$REPO_DIR"
