@@ -3,7 +3,7 @@ run-name: Verify PR - ${{ github.event.pull_request.title || github.sha }}
 
 # Triggered when an auto-PR from Hyperloom gets the `verify-enabled` label
 # (also re-runs on synchronize so PR updates re-verify automatically).
-# Detects which mi355x bench scripts changed, then for each script creates
+# Detects which mi300x bench scripts changed, then for each script creates
 # a SaFE training pod that runs baseline (PR base) + optimized (PR head)
 # for the full (tp, conc, isl, osl) search-space from amd-master.yaml,
 # posting a gain% table back to the PR.
@@ -12,7 +12,7 @@ on:
   pull_request:
     types: [labeled, synchronize]
     paths:
-      - "benchmarks/single_node/*mi355x*.sh"
+      - "benchmarks/single_node/*mi300x*.sh"
       - "benchmarks/benchmark_lib.sh"
       - ".github/scripts/**"
       - ".github/configs/hyperloom-verify.yaml"
@@ -108,7 +108,7 @@ jobs:
   verify:
     needs: detect
     if: needs.detect.outputs.count != '0'
-    runs-on: inferencexfork-t25db
+    runs-on: inferencexfork-f29v5
     timeout-minutes: 1440
     strategy:
       fail-fast: false
@@ -267,7 +267,8 @@ jobs:
           gh pr comment "$PR" --repo "$REPO" --body-file "$BODY"
 
       - name: Send Teams webhook notification
-        if: env.TEAMS_WEBHOOK_URL != ''
+        # Skip Teams card on verify failure/cancel; PR comment still posts.
+        if: needs.verify.result == 'success' && env.TEAMS_WEBHOOK_URL != ''
         env:
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
