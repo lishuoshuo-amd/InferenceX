@@ -226,10 +226,19 @@ jobs:
               except Exception as e:
                   print(f"<!-- failed to read {p}: {e} -->")
 
+          # Separate throughput rows from eval rows
+          throughput_rows = [r for r in rows if not r.get("mode", "").endswith("-eval")]
+          eval_rows = [r for r in rows if r.get("mode", "").endswith("-eval")]
+
           buckets = defaultdict(dict)
-          for r in rows:
+          for r in throughput_rows:
               key = (r["script"], r["tp"], r["conc"], r["isl"], r["osl"])
               buckets[key][r["mode"]] = r
+
+          eval_by_script = defaultdict(dict)
+          for r in eval_rows:
+              mode = r["mode"].replace("-eval", "")
+              eval_by_script[r["script"]][mode] = r
 
           print("### Verify PR (Hyperloom) — Unofficial smoke test\n")
           print("> Only the upstream [InferenceX](https://github.com/SemiAnalysisAI/InferenceX)")
@@ -261,6 +270,22 @@ jobs:
                   else:
                       print(f"| {isl_osl} | {tp} | {conc} | {bt or 'FAIL'} | {ot or 'FAIL'} | n/a | FAIL |")
               print()
+
+              # GSM8K eval results for this script
+              evals = eval_by_script.get(script, {})
+              if evals:
+                  b_eval = evals.get("baseline", {}).get("eval_score")
+                  o_eval = evals.get("optimized", {}).get("eval_score")
+                  b_str = f"{b_eval*100:.1f}%" if b_eval is not None else "N/A"
+                  o_str = f"{o_eval*100:.1f}%" if o_eval is not None else "N/A"
+                  if b_eval is not None and o_eval is not None:
+                      diff = (o_eval - b_eval) * 100
+                      verdict = "OK" if diff >= -2.0 else "WARN: accuracy drop"
+                      diff_str = f"{diff:+.1f}pp"
+                  else:
+                      verdict = "N/A"
+                      diff_str = "n/a"
+                  print(f"**GSM8K Accuracy:** baseline={b_str} | optimized={o_str} | delta={diff_str} | {verdict}\n")
           PY
           fi
 
@@ -302,10 +327,18 @@ jobs:
               except Exception:
                   pass
 
+          throughput_rows = [r for r in all_rows if not r.get("mode", "").endswith("-eval")]
+          eval_rows = [r for r in all_rows if r.get("mode", "").endswith("-eval")]
+
           buckets = defaultdict(dict)
-          for r in all_rows:
+          for r in throughput_rows:
               key = (r["script"], r["tp"], r["conc"], r["isl"], r["osl"])
               buckets[key][r["mode"]] = r
+
+          eval_by_script = defaultdict(dict)
+          for r in eval_rows:
+              mode = r["mode"].replace("-eval", "")
+              eval_by_script[r["script"]][mode] = r
 
           by_script = defaultdict(list)
           for key, modes in buckets.items():
@@ -345,11 +378,29 @@ jobs:
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{gain:+.1f}%", "size": "Small", "color": gc, "weight": "Bolder"}]},
                   ]})
 
+              # GSM8K eval row in Teams card
+              evals = eval_by_script.get(script, {})
+              eval_text = ""
+              if evals:
+                  b_s = evals.get("baseline", {}).get("eval_score")
+                  o_s = evals.get("optimized", {}).get("eval_score")
+                  b_str = f"{b_s*100:.1f}%" if b_s is not None else "N/A"
+                  o_str = f"{o_s*100:.1f}%" if o_s is not None else "N/A"
+                  if b_s is not None and o_s is not None:
+                      diff = (o_s - b_s) * 100
+                      eval_text = f"GSM8K: {b_str} \u2192 {o_str} ({diff:+.1f}pp)"
+                  else:
+                      eval_text = f"GSM8K: {b_str} \u2192 {o_str}"
+
+              subtitle = f"Avg Gain: {avg_gain:+.1f}% | {len(complete)}/{total_pairs} pairs"
+              if eval_text:
+                  subtitle += f" | {eval_text}"
+
               body = [
                   {"type": "TextBlock", "weight": "Bolder", "size": "Medium",
                    "text": f"{icon} PR#{pr_num} Verify: {short}"},
                   {"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
-                   "text": f"Avg Gain: {avg_gain:+.1f}% | {len(complete)}/{total_pairs} pairs"},
+                   "text": subtitle},
                   {"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
                    "columns": [{"width": 1}] * 6, "rows": detail_rows},
               ]

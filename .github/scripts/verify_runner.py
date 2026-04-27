@@ -192,6 +192,90 @@ def build_entrypoint(
             run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
         done
 
+        # ── GSM8K accuracy eval (once per script, using the first point's TP/EP) ──
+        # Uses EVAL_ONLY=true so the benchmark script:
+        #   1. Calls setup_eval_context → sets correct EVAL_MAX_MODEL_LEN for server
+        #   2. Starts server with eval-appropriate context length
+        #   3. Skips run_benchmark_serving (no throughput run)
+        #   4. Runs run_eval (GSM8K via lm-eval) only
+        run_eval_once() {{
+            local mode=$1 ref=$2 tp=$3 ep=$4
+            local tag="eval-${{mode}}"
+
+            echo "--- Eval $tag @ $ref (tp=$tp ep=$ep) ---"
+            pkill -f "sglang.launch_server" 2>/dev/null || true
+            pkill -f "sglang.srt" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "vllm.entrypoints" 2>/dev/null || true
+            pkill -f "ray::" 2>/dev/null || true
+            sleep 8
+            pkill -9 -f "sglang" 2>/dev/null || true
+            pkill -9 -f "vllm" 2>/dev/null || true
+            sleep 2
+            fuser -k 8888/tcp 2>/dev/null || true
+            rm -f /dev/shm/vllm_* /dev/shm/sglang_* 2>/dev/null || true
+            rm -rf /workspace && mkdir -p /workspace
+
+            cd "$REPO_DIR"
+            git --work-tree=/workspace checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
+                git --work-tree=/workspace checkout "$ref" -- benchmarks utils
+
+            sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \\
+                "/workspace/benchmarks/single_node/{script}"
+
+            local result_file="verify-${{tag}}-{script.replace('.sh', '')}"
+            set +e
+            cd /workspace
+
+            MODEL="{model_path}" \\
+            TP="$tp" CONC=32 EP_SIZE="$ep" \\
+            ISL=1024 OSL=8192 MAX_MODEL_LEN=16384 \\
+            RANDOM_RANGE_RATIO="{random_range_ratio}" \\
+            RESULT_FILENAME="$result_file" \\
+            RUN_EVAL=true EVAL_ONLY=true EXP_NAME=verify-eval \\
+                bash benchmarks/single_node/{script}
+            local rc=$?
+            set -e
+
+            # Extract GSM8K score from lm-eval results
+            local eval_score="null"
+            local eval_json
+            eval_json=$(find /workspace -path "*/results*.json" -name "results*.json" 2>/dev/null | head -1)
+            if [[ -n "$eval_json" && -f "$eval_json" ]]; then
+                eval_score=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$eval_json'))
+    r = d.get('results', {{}})
+    for task, metrics in r.items():
+        for k in ['exact_match,strict-match', 'exact_match,flexible-extract', 'acc,none']:
+            if k in metrics:
+                print(f'{{metrics[k]:.4f}}')
+                sys.exit(0)
+    print('null')
+except Exception:
+    print('null')
+" 2>/dev/null || echo "null")
+                cp -f "$eval_json" "$NFS_DIR/${{tag}}-results.json" 2>/dev/null || true
+            fi
+
+            # Append eval result to summary
+            jq --arg s "{script}" --arg m "$mode" --arg es "$eval_score" --arg rc "$rc" \\
+               '. += [{{script:$s, mode:($m + "-eval"),
+                       eval_score:($es|tonumber? // null),
+                       exit_code:($rc|tonumber)}}]' \\
+               "$SUMMARY" > "$SUMMARY.tmp" && mv "$SUMMARY.tmp" "$SUMMARY"
+
+            echo "--- Done $tag (rc=$rc, eval_score=$eval_score) ---"
+        }}
+
+        EVAL_TP=$(echo "$RUNS_JSON" | jq -r '.[0].tp')
+        EVAL_EP=$(echo "$RUNS_JSON" | jq -r '.[0].ep // 1')
+        echo ""
+        echo "=== GSM8K eval phase (tp=$EVAL_TP ep=$EVAL_EP) ==="
+        run_eval_once baseline  "{base_sha}" "$EVAL_TP" "$EVAL_EP"
+        run_eval_once optimized "{head_sha}" "$EVAL_TP" "$EVAL_EP"
+
         echo ""
         echo "=== Summary for {script} ==="
         cat "$SUMMARY"
@@ -338,14 +422,18 @@ def run(args: argparse.Namespace) -> int:
         local_summary.write_text("[]")
         return 1
 
-    # Validate results: every (tp, conc, isl, osl) must have both baseline + optimized
+    # Validate results: separate throughput rows from eval rows
     import json as _json
     from collections import defaultdict
     results = _json.loads(local_summary.read_text())
-    total = len(results)
-    ok = sum(1 for r in results if r.get("throughput") and r["throughput"] > 0)
+
+    throughput_results = [r for r in results if not r.get("mode", "").endswith("-eval")]
+    eval_results = [r for r in results if r.get("mode", "").endswith("-eval")]
+
+    total = len(throughput_results)
+    ok = sum(1 for r in throughput_results if r.get("throughput") and r["throughput"] > 0)
     fail = total - ok
-    log.info("Results: %d total, %d ok, %d failed", total, ok, fail)
+    log.info("Throughput results: %d total, %d ok, %d failed", total, ok, fail)
 
     if total == 0:
         log.error("No benchmark results produced")
@@ -353,12 +441,12 @@ def run(args: argparse.Namespace) -> int:
 
     expected_points = len(args.runs) * 2  # baseline + optimized per point
     if total < expected_points:
-        log.warning("Incomplete: %d/%d results (pod may have been killed early)",
+        log.warning("Incomplete: %d/%d throughput results (pod may have been killed early)",
                      total, expected_points)
 
-    # Check paired completeness
+    # Check paired completeness (throughput only)
     buckets = defaultdict(dict)
-    for r in results:
+    for r in throughput_results:
         key = (r["tp"], r["conc"], r["isl"], r["osl"])
         buckets[key][r["mode"]] = r
 
@@ -384,6 +472,25 @@ def run(args: argparse.Namespace) -> int:
 
     if paired_ok == 0:
         log.error("No complete baseline+optimized pairs — verify cannot proceed")
+        return 1
+
+    # Validate GSM8K eval results (hard requirement: both must produce a score)
+    eval_modes = {r["mode"].replace("-eval", ""): r for r in eval_results}
+    eval_ok = True
+    for mode_name in ("baseline", "optimized"):
+        er = eval_modes.get(mode_name)
+        if not er:
+            log.error("GSM8K eval missing for %s — no eval row in summary", mode_name)
+            eval_ok = False
+        elif er.get("eval_score") is None:
+            log.error("GSM8K eval produced no score for %s (exit_code=%s)",
+                       mode_name, er.get("exit_code"))
+            eval_ok = False
+        else:
+            log.info("GSM8K eval %s: score=%.4f", mode_name, er["eval_score"])
+
+    if not eval_ok:
+        log.error("GSM8K eval did not complete successfully for both baseline and optimized")
         return 1
 
     if status != "completed":
