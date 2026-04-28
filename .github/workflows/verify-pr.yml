@@ -108,7 +108,7 @@ jobs:
   verify:
     needs: detect
     if: needs.detect.outputs.count != '0'
-    runs-on: inferencexfork-f29v5
+    runs-on: inferencexfork-n6nnm
     timeout-minutes: 1440
     strategy:
       fail-fast: false
