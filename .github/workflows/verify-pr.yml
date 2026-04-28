@@ -159,7 +159,7 @@ jobs:
       - name: Submit SaFE workload for ${{ matrix.script.name }}
         run: |
           set -euo pipefail
-          NFS_DIR="/shared_nfs/lss/verify-pr/${{ github.event.pull_request.number }}/${SCRIPT%.sh}"
+          NFS_DIR="/wekafs/shuoshuo/verify-pr/${{ github.event.pull_request.number }}/${SCRIPT%.sh}"
           python3 .github/scripts/verify_runner.py \
             --script "$SCRIPT" \
             --runs-json "$RUNS_JSON" \
