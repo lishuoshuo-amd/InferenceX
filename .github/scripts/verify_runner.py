@@ -160,25 +160,42 @@ def build_entrypoint(
             set -e
 
             local result_json="/workspace/${{result_file}}.json"
-            local throughput="null"
+            local output_tp="null" total_tp="null" request_tp="null"
             if [[ -f "$result_json" ]]; then
-                throughput=$(jq -r '.output_throughput // .total_token_throughput // .request_throughput // empty' "$result_json" || true)
+                output_tp=$(jq -r '.output_throughput // empty' "$result_json" 2>/dev/null || echo "null")
+                total_tp=$(jq -r '.total_token_throughput // empty' "$result_json" 2>/dev/null || echo "null")
+                request_tp=$(jq -r '.request_throughput // empty' "$result_json" 2>/dev/null || echo "null")
+            fi
+            # Convert to per-GPU (÷ TP, matching official process_result.py)
+            local otpg="null" tpg="null" itpg="null"
+            if [[ "$output_tp" != "null" && -n "$output_tp" ]]; then
+                otpg=$(echo "$output_tp $tp" | awk '{{printf "%.4f", $1/$2}}')
+            fi
+            if [[ "$total_tp" != "null" && -n "$total_tp" ]]; then
+                tpg=$(echo "$total_tp $tp" | awk '{{printf "%.4f", $1/$2}}')
+            fi
+            if [[ "$total_tp" != "null" && "$output_tp" != "null" && -n "$total_tp" && -n "$output_tp" ]]; then
+                itpg=$(echo "$total_tp $output_tp $tp" | awk '{{printf "%.4f", ($1-$2)/$3}}')
             fi
 
             # Copy artifacts to NFS
             cp -f /workspace/server.log "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
             [[ -f "$result_json" ]] && cp -f "$result_json" "$NFS_DIR/${{result_file}}.json"
 
-            # Append to summary
-            jq --arg s "{script}" --arg m "$mode" --arg t "${{throughput:-null}}" \\
+            # Append to summary (per-GPU metrics aligned with official Dashboard)
+            jq --arg s "{script}" --arg m "$mode" \\
+               --arg otpg "$otpg" --arg tpg "$tpg" --arg itpg "$itpg" \\
                --arg tp "$tp" --arg c "$conc" --arg i "$isl" --arg o "$osl" --arg rc "$rc" \\
-               '. += [{{script:$s, mode:$m, throughput:($t|tonumber? // null),
+               '. += [{{script:$s, mode:$m,
+                       output_tput_per_gpu:($otpg|tonumber? // null),
+                       tput_per_gpu:($tpg|tonumber? // null),
+                       input_tput_per_gpu:($itpg|tonumber? // null),
                        tp:($tp|tonumber), conc:($c|tonumber),
                        isl:($i|tonumber), osl:($o|tonumber),
                        exit_code:($rc|tonumber)}}]' \\
                "$SUMMARY" > "$SUMMARY.tmp" && mv "$SUMMARY.tmp" "$SUMMARY"
 
-            echo "--- Done $tag (rc=$rc, throughput=$throughput) ---"
+            echo "--- Done $tag (rc=$rc, output_tput_per_gpu=$otpg, tput_per_gpu=$tpg) ---"
         }}
 
         for i in $(seq 0 $((NPTS - 1))); do
@@ -435,7 +452,8 @@ def run(args: argparse.Namespace) -> int:
     eval_results = [r for r in results if r.get("mode", "").endswith("-eval")]
 
     total = len(throughput_results)
-    ok = sum(1 for r in throughput_results if r.get("throughput") and r["throughput"] > 0)
+    ok = sum(1 for r in throughput_results
+             if r.get("output_tput_per_gpu") and r["output_tput_per_gpu"] > 0)
     fail = total - ok
     log.info("Throughput results: %d total, %d ok, %d failed", total, ok, fail)
 
@@ -459,15 +477,15 @@ def run(args: argparse.Namespace) -> int:
     for key, modes in buckets.items():
         b = modes.get("baseline", {})
         o = modes.get("optimized", {})
-        bt = b.get("throughput") if b else None
-        ot = o.get("throughput") if o else None
+        bt = b.get("output_tput_per_gpu") if b else None
+        ot = o.get("output_tput_per_gpu") if o else None
         if bt and bt > 0 and ot and ot > 0:
             paired_ok += 1
         else:
             paired_fail += 1
             missing = []
-            if not bt or bt == 0: missing.append("baseline")
-            if not ot or ot == 0: missing.append("optimized")
+            if not (bt and bt > 0): missing.append("baseline")
+            if not (ot and ot > 0): missing.append("optimized")
             log.warning("Incomplete pair tp=%s conc=%s isl=%s osl=%s: missing %s",
                         key[0], key[1], key[2], key[3], "+".join(missing))
 

@@ -29,6 +29,7 @@ jobs:
     outputs:
       scripts: ${{ steps.expand.outputs.scripts }}
       count: ${{ steps.expand.outputs.count }}
+      dashboard_map: ${{ steps.expand.outputs.dashboard_map }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,16 +93,28 @@ jobs:
           if [[ ${#MATCHED[@]} -eq 0 ]]; then
             echo "scripts=[]" >> "$GITHUB_OUTPUT"
             echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "dashboard_map={}" >> "$GITHUB_OUTPUT"
           else
             JSON='[]'
+            DASH_MAP='{}'
             for s in "${MATCHED[@]}"; do
               JSON=$(echo "$JSON" | jq -c \
                 --arg name "$s" \
                 --argjson runs "${SCRIPT_RUNS[$s]}" \
                 '. += [{name: $name, runs: $runs}]')
+              cfg=".github/configs/hyperloom-verify.yaml"
+              dash_model=$(yq -r ".scripts[\"$s\"].dashboard_model // \"\"" "$cfg")
+              dash_prec=$(yq -r ".scripts[\"$s\"].dashboard_precision // \"\"" "$cfg")
+              dash_fw=$(yq -r ".scripts[\"$s\"].dashboard_framework // \"\"" "$cfg")
+              if [[ -n "$dash_model" && "$dash_model" != "null" ]]; then
+                DASH_MAP=$(echo "$DASH_MAP" | jq -c \
+                  --arg k "$s" --arg m "$dash_model" --arg p "$dash_prec" --arg f "$dash_fw" \
+                  '. + {($k): {model: $m, precision: $p, framework: $f}}')
+              fi
             done
             echo "scripts=$JSON" >> "$GITHUB_OUTPUT"
             echo "count=${#MATCHED[@]}" >> "$GITHUB_OUTPUT"
+            echo "dashboard_map=$DASH_MAP" >> "$GITHUB_OUTPUT"
           fi
           echo "Matched scripts: ${MATCHED[*]:-<none>}"
 
@@ -192,6 +205,10 @@ jobs:
     if: always() && needs.verify.result != 'skipped' && needs.detect.outputs.count != '0'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts/dashboard_client.py
+
       - uses: actions/download-artifact@v4
         with:
           path: all-results
@@ -204,6 +221,7 @@ jobs:
           GH_TOKEN: ${{ secrets.SYNC_PAT }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          DASHBOARD_MAP: ${{ needs.detect.outputs.dashboard_map }}
         run: |
           set -euo pipefail
           BODY=comment.md
@@ -218,8 +236,13 @@ jobs:
           EOF
           else
             python3 - "${summaries[@]}" > "$BODY" <<'PY'
-          import json, sys, pathlib
+          import json, os, sys, pathlib
           from collections import defaultdict
+          sys.path.insert(0, ".github/scripts")
+          from dashboard_client import fetch_official_reference
+
+          dashboard_map = json.loads(os.environ.get("DASHBOARD_MAP", "{}"))
+
           rows = []
           for p in sys.argv[1:]:
               try:
@@ -227,7 +250,6 @@ jobs:
               except Exception as e:
                   print(f"<!-- failed to read {p}: {e} -->")
 
-          # Separate throughput rows from eval rows
           throughput_rows = [r for r in rows if not r.get("mode", "").endswith("-eval")]
           eval_rows = [r for r in rows if r.get("mode", "").endswith("-eval")]
 
@@ -241,39 +263,95 @@ jobs:
               mode = r["mode"].replace("-eval", "")
               eval_by_script[r["script"]][mode] = r
 
+          # Fetch official Dashboard data per script (with precision/framework filter)
+          official_cache = {}
+          for script, dash_cfg in dashboard_map.items():
+              if isinstance(dash_cfg, str):
+                  dash_cfg = {"model": dash_cfg}
+              if dash_cfg.get("model"):
+                  official_cache[script] = fetch_official_reference(
+                      dash_cfg["model"],
+                      precision=dash_cfg.get("precision") or None,
+                      framework=dash_cfg.get("framework") or None,
+                  )
+
           print("### Verify PR (Hyperloom) — Unofficial smoke test\n")
-          print("> Only the upstream [InferenceX](https://github.com/SemiAnalysisAI/InferenceX)")
-          print("> repo contains the official benchmark of record. This fork verify reproduces")
-          print("> the full (tp, conc, isl, osl) search-space from `amd-master.yaml` for each")
-          print("> changed script, running both PR base and PR head; results below are a")
-          print("> smoke-test indicator. ±2% is treated as noise (verdict OK).\n")
+          print("> Compares PR base (Baseline) and PR head (Optimized) against the")
+          print("> [InferenceX Dashboard](https://inferencex.semianalysis.com/inference)")
+          print("> official MI300X reference. ±2% gain is treated as noise (verdict OK).\n")
 
           by_script = defaultdict(list)
           for key, modes in buckets.items():
               by_script[key[0]].append((key, modes))
 
           for script in sorted(by_script):
+              official = official_cache.get(script, {})
+              ref_date = ""
+              if official:
+                  ref_date = next(iter(official.values()), {}).get("date", "")
+
               print(f"#### `{script}`\n")
-              print("| isl/osl | tp | conc | baseline (tok/s) | optimized (tok/s) | gain | verdict |")
-              print("|---|---|---|---|---|---|---|")
+
+              # Summary line
               entries = sorted(
                   by_script[script],
                   key=lambda kv: (kv[0][3], kv[0][4], kv[0][1], kv[0][2]),
               )
+              gains, aligns = [], []
               for (s, tp, conc, isl, osl), modes in entries:
                   b = modes.get("baseline", {}); o = modes.get("optimized", {})
-                  bt, ot = b.get("throughput"), o.get("throughput")
-                  isl_osl = f"{isl//1024}k{osl//1024}k" if isl % 1024 == 0 and osl % 1024 == 0 else f"{isl}/{osl}"
-                  if bt and ot:
+                  bt = b.get("output_tput_per_gpu"); ot = o.get("output_tput_per_gpu")
+                  ref = official.get((isl, osl, conc, tp), {})
+                  rt = ref.get("output_tput_per_gpu")
+                  if bt and ot and bt > 0:
+                      gains.append((ot - bt) / bt * 100)
+                  if bt and rt and rt > 0:
+                      aligns.append((bt - rt) / rt * 100)
+
+              avg_gain = sum(gains) / len(gains) if gains else 0
+              avg_align = sum(abs(a) for a in aligns) / len(aligns) if aligns else 0
+              summary_parts = []
+              if aligns:
+                  summary_parts.append(f"**Alignment:** avg ±{avg_align:.1f}% vs Dashboard ({ref_date})")
+              summary_parts.append(f"**Performance:** avg gain {avg_gain:+.1f}% across {len(gains)} points")
+
+              evals = eval_by_script.get(script, {})
+              if evals:
+                  b_eval = evals.get("baseline", {}).get("eval_score")
+                  o_eval = evals.get("optimized", {}).get("eval_score")
+                  if b_eval is not None and o_eval is not None:
+                      diff = (o_eval - b_eval) * 100
+                      verdict = "OK" if diff >= -2.0 else "WARN"
+                      summary_parts.append(f"**GSM8K:** {b_eval*100:.1f}% → {o_eval*100:.1f}% ({diff:+.1f}pp, {verdict})")
+
+              print(" | ".join(summary_parts) + "\n")
+
+              print("| Config | Official | Baseline | Optimized | Align | Gain | Verdict |")
+              print("|--------|----------|----------|-----------|-------|------|---------|")
+
+              for (s, tp, conc, isl, osl), modes in entries:
+                  b = modes.get("baseline", {}); o = modes.get("optimized", {})
+                  bt = b.get("output_tput_per_gpu"); ot = o.get("output_tput_per_gpu")
+                  ref = official.get((isl, osl, conc, tp), {})
+                  rt = ref.get("output_tput_per_gpu")
+
+                  isl_s = f"{isl//1024}k" if isl % 1024 == 0 else str(isl)
+                  osl_s = f"{osl//1024}k" if osl % 1024 == 0 else str(osl)
+                  config = f"{isl_s}/{osl_s} tp{tp} c{conc}"
+                  rt_s = f"{rt:.1f}" if rt else "N/A"
+
+                  if bt and ot and bt > 0:
                       gain = (ot - bt) / bt * 100
+                      align_s = f"{(bt - rt) / rt * 100:+.1f}%" if rt and rt > 0 else "N/A"
+                      align_warn = " ⚠" if rt and rt > 0 and abs((bt - rt) / rt * 100) > 10 else ""
                       verdict = "OK" if gain >= -2.0 else "WARN: regression"
-                      print(f"| {isl_osl} | {tp} | {conc} | {bt:.2f} | {ot:.2f} | {gain:+.2f}% | {verdict} |")
+                      print(f"| {config} | {rt_s} | {bt:.1f} | {ot:.1f} | {align_s}{align_warn} | {gain:+.1f}% | {verdict} |")
                   else:
-                      print(f"| {isl_osl} | {tp} | {conc} | {bt or 'FAIL'} | {ot or 'FAIL'} | n/a | FAIL |")
+                      bt_s = f"{bt:.1f}" if bt else "FAIL"
+                      ot_s = f"{ot:.1f}" if ot else "FAIL"
+                      print(f"| {config} | {rt_s} | {bt_s} | {ot_s} | N/A | N/A | FAIL |")
               print()
 
-              # GSM8K eval results for this script
-              evals = eval_by_script.get(script, {})
               if evals:
                   b_eval = evals.get("baseline", {}).get("eval_score")
                   o_eval = evals.get("optimized", {}).get("eval_score")
@@ -285,8 +363,16 @@ jobs:
                       diff_str = f"{diff:+.1f}pp"
                   else:
                       verdict = "N/A"
-                      diff_str = "n/a"
+                      diff_str = "N/A"
                   print(f"**GSM8K Accuracy:** baseline={b_str} | optimized={o_str} | delta={diff_str} | {verdict}\n")
+
+              note = "*Values: output\\_tput\\_per\\_gpu (output tok/s per GPU, ÷ TP)."
+              note += " tput\\_per\\_gpu (total) and input\\_tput\\_per\\_gpu also recorded in summary artifact."
+              if ref_date:
+                  note += f" Official ref: [InferenceX Dashboard](https://inferencex.semianalysis.com/inference) MI300X ({ref_date}).*"
+              else:
+                  note += " Official ref: N/A (Dashboard unavailable).*"
+              print(note + "\n")
           PY
           fi
 
@@ -300,12 +386,15 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          DASHBOARD_MAP: ${{ needs.detect.outputs.dashboard_map }}
         run: |
           pip install --quiet requests 2>/dev/null || true
           python3 - <<'TEAMS'
           import json, os, sys, time, requests
           from collections import defaultdict
           from pathlib import Path
+          sys.path.insert(0, ".github/scripts")
+          from dashboard_client import fetch_official_reference
 
           webhook = os.environ.get("TEAMS_WEBHOOK_URL", "")
           if not webhook:
@@ -315,6 +404,7 @@ jobs:
           pr_num = os.environ.get("PR_NUMBER", "?")
           pr_title = os.environ.get("PR_TITLE", "")
           pr_url = os.environ.get("PR_URL", "")
+          dashboard_map = json.loads(os.environ.get("DASHBOARD_MAP", "{}"))
 
           summaries = sorted(Path("all-results").glob("summary-*.json"))
           if not summaries:
@@ -341,45 +431,74 @@ jobs:
               mode = r["mode"].replace("-eval", "")
               eval_by_script[r["script"]][mode] = r
 
+          # Fetch official data (with precision/framework filter)
+          official_cache = {}
+          for script, dash_cfg in dashboard_map.items():
+              if isinstance(dash_cfg, str):
+                  dash_cfg = {"model": dash_cfg}
+              if dash_cfg.get("model"):
+                  official_cache[script] = fetch_official_reference(
+                      dash_cfg["model"],
+                      precision=dash_cfg.get("precision") or None,
+                      framework=dash_cfg.get("framework") or None,
+                  )
+
           by_script = defaultdict(list)
           for key, modes in buckets.items():
               by_script[key[0]].append((key, modes))
 
-          # Send one card per model
           for script in sorted(by_script):
               pairs = by_script[script]
+              official = official_cache.get(script, {})
               complete = [(k, m) for k, m in pairs
-                          if m.get("baseline", {}).get("throughput") and m["baseline"]["throughput"] > 0
-                          and m.get("optimized", {}).get("throughput") and m["optimized"]["throughput"] > 0]
+                          if m.get("baseline", {}).get("output_tput_per_gpu")
+                          and m["baseline"]["output_tput_per_gpu"] > 0
+                          and m.get("optimized", {}).get("output_tput_per_gpu")
+                          and m["optimized"]["output_tput_per_gpu"] > 0]
               total_pairs = len(pairs)
-              gains = [(m["optimized"]["throughput"] - m["baseline"]["throughput"]) / m["baseline"]["throughput"] * 100
+              gains = [(m["optimized"]["output_tput_per_gpu"] - m["baseline"]["output_tput_per_gpu"])
+                       / m["baseline"]["output_tput_per_gpu"] * 100
                        for k, m in complete]
               avg_gain = sum(gains) / len(gains) if gains else 0
+
+              aligns = []
+              for (s, tp, conc, isl, osl), modes in complete:
+                  bt = modes["baseline"]["output_tput_per_gpu"]
+                  ref = official.get((isl, osl, conc, tp), {})
+                  rt = ref.get("output_tput_per_gpu")
+                  if rt and rt > 0:
+                      aligns.append(abs((bt - rt) / rt * 100))
+
+              avg_align = sum(aligns) / len(aligns) if aligns else 0
               icon = "\u2705" if avg_gain >= -2.0 else "\u26a0\ufe0f"
               short = script.replace(".sh", "")
 
-              header = ["ISL/OSL", "TP", "Conc", "Baseline", "Optimized", "Gain"]
+              header = ["Config", "Official", "Baseline", "Optimized", "Gain"]
               detail_rows = [{"type": "TableRow", "style": "accent", "cells": [
                   {"type": "TableCell", "items": [{"type": "TextBlock", "text": c, "weight": "Bolder", "size": "Small"}]}
                   for c in header
               ]}]
 
               for (s, tp, conc, isl, osl), modes in sorted(complete, key=lambda x: (x[0][3], x[0][4], x[0][1], x[0][2])):
-                  bt = modes["baseline"]["throughput"]
-                  ot = modes["optimized"]["throughput"]
+                  bt = modes["baseline"]["output_tput_per_gpu"]
+                  ot = modes["optimized"]["output_tput_per_gpu"]
                   gain = (ot - bt) / bt * 100
-                  isl_s = f"{isl//1024}k/{osl//1024}k" if isl % 1024 == 0 and osl % 1024 == 0 else f"{isl}/{osl}"
+                  ref = official.get((isl, osl, conc, tp), {})
+                  rt = ref.get("output_tput_per_gpu")
+
+                  isl_s = f"{isl//1024}k" if isl % 1024 == 0 else str(isl)
+                  osl_s = f"{osl//1024}k" if osl % 1024 == 0 else str(osl)
+                  config = f"{isl_s}/{osl_s} tp{tp} c{conc}"
+                  rt_s = f"{rt:.1f}" if rt else "N/A"
                   gc = "Good" if gain > 0 else "Attention" if gain < -2 else "Default"
                   detail_rows.append({"type": "TableRow", "cells": [
-                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": isl_s, "size": "Small"}]},
-                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(tp), "size": "Small"}]},
-                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": str(conc), "size": "Small"}]},
-                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{bt:.0f}", "size": "Small"}]},
-                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{ot:.0f}", "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": config, "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": rt_s, "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{bt:.1f}", "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{ot:.1f}", "size": "Small"}]},
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{gain:+.1f}%", "size": "Small", "color": gc, "weight": "Bolder"}]},
                   ]})
 
-              # GSM8K eval row in Teams card
               evals = eval_by_script.get(script, {})
               eval_text = ""
               if evals:
@@ -393,7 +512,10 @@ jobs:
                   else:
                       eval_text = f"GSM8K: {b_str} \u2192 {o_str}"
 
-              subtitle = f"Avg Gain: {avg_gain:+.1f}% | {len(complete)}/{total_pairs} pairs"
+              subtitle = f"Avg Gain: {avg_gain:+.1f}%"
+              if aligns:
+                  subtitle += f" | Align: \u00b1{avg_align:.1f}%"
+              subtitle += f" | {len(complete)}/{total_pairs} pairs"
               if eval_text:
                   subtitle += f" | {eval_text}"
 
@@ -402,8 +524,10 @@ jobs:
                    "text": f"{icon} PR#{pr_num} Verify: {short}"},
                   {"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
                    "text": subtitle},
+                  {"type": "TextBlock", "isSubtle": True, "spacing": "None", "size": "Small",
+                   "text": "output_tput_per_gpu (tok/s/gpu)"},
                   {"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
-                   "columns": [{"width": 1}] * 6, "rows": detail_rows},
+                   "columns": [{"width": 2}] + [{"width": 1}] * 4, "rows": detail_rows},
               ]
 
               card = {"type": "message", "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": {
