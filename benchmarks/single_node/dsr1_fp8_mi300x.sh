@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# [test] smoke-test GSM8K eval in verify-pr — remove this line after test
+# [test] verify-pr dashboard + per-gpu metrics — remove this line after test
 
 source "$(dirname "$0")/../benchmark_lib.sh"
 
