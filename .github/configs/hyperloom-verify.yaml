@@ -15,26 +15,26 @@
 
 scripts:
   dsr1_fp8_mi300x.sh:
-    model_path: /hyperloom/models/DeepSeek-R1-0528
+    model_path: /wekafs/models/DeepSeek-R1-0528
     master_config_key: dsr1-fp8-mi300x-sglang
 
   qwen3.5_bf16_mi300x.sh:
-    model_path: /hyperloom/models/Qwen-Qwen3.5-397B-A17B
+    model_path: /wekafs/models/Qwen-Qwen3.5-397B-A17B
     master_config_key: qwen3.5-bf16-mi300x-sglang
 
   # TODO: re-enable once amd-master.yaml adds `glm5-fp8-mi300x-sglang`.
   # glm5_fp8_mi300x.sh:
-  #   model_path: /hyperloom/models/GLM-5-FP8
+  #   model_path: /wekafs/models/GLM-5-FP8
   #   master_config_key: glm5-fp8-mi300x-sglang
 
   kimik2.5_int4_mi300x.sh:
-    model_path: /hyperloom/models/Kimi-K2.5
+    model_path: /wekafs/models/Kimi-K2.5
     master_config_key: kimik2.5-int4-mi300x-vllm
 
   minimaxm2.5_fp8_mi300x.sh:
-    model_path: /hyperloom/models/MiniMaxAI-MiniMax-M2.5
+    model_path: /wekafs/models/MiniMaxAI-MiniMax-M2.5
     master_config_key: minimaxm2.5-fp8-mi300x-vllm
 
   gptoss_fp4_mi300x.sh:
-    model_path: /hyperloom/models/gpt-oss-120b
+    model_path: /wekafs/models/gpt-oss-120b
     master_config_key: gptoss-fp4-mi300x-vllm
