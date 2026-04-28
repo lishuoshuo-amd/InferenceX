@@ -286,6 +286,10 @@ except Exception:
 
 def run(args: argparse.Namespace) -> int:
     """Main: create SaFE workload, poll, collect results."""
+    if not args.safe_api_base:
+        log.error("SAFE_API_BASE not set — configure it as a GitHub secret or pass --safe-api-base")
+        return 1
+
     log.info("Script: %s | Points: %d | Image: %s", args.script, len(args.runs), args.image)
 
     client = SaFEClient(
@@ -515,7 +519,8 @@ def main():
     parser.add_argument("--nfs-result-dir", required=True, help="NFS directory for pod to write results")
     parser.add_argument("--output-dir", default="verify-results", help="Local output dir for CI artifacts")
 
-    parser.add_argument("--safe-api-base", default="https://oci-slc.primus-safe.amd.com")
+    parser.add_argument("--safe-api-base", default=os.environ.get("SAFE_API_BASE", ""),
+                        help="SaFE API base URL (or set SAFE_API_BASE env var)")
     parser.add_argument("--safe-api-key", default=os.environ.get("SAFE_API_KEY", ""))
     parser.add_argument("--safe-workspace-id", default=os.environ.get("SAFE_WORKSPACE_ID", ""))
     parser.add_argument("--no-verify-ssl", action="store_true", default=False)

@@ -122,6 +122,7 @@ jobs:
       RANDOM_RANGE_RATIO: "0.8"
       SCRIPT: ${{ matrix.script.name }}
       RUNS_JSON: ${{ toJson(matrix.script.runs) }}
+      SAFE_API_BASE: ${{ secrets.SAFE_API_BASE }}
       SAFE_API_KEY: ${{ secrets.SAFE_API_KEY }}
       SAFE_WORKSPACE_ID: ${{ secrets.SAFE_WORKSPACE_ID }}
     steps:
