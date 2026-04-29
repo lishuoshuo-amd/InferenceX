@@ -310,21 +310,12 @@ jobs:
 
               avg_gain = sum(gains) / len(gains) if gains else 0
               avg_align = sum(abs(a) for a in aligns) / len(aligns) if aligns else 0
-              summary_parts = []
+              print(f"**Avg Gain:** {avg_gain:+.1f}% — avg (optimized − baseline) / baseline across {len(gains)} configs")
               if aligns:
-                  summary_parts.append(f"**Alignment:** avg ±{avg_align:.1f}% vs Dashboard ({ref_date})")
-              summary_parts.append(f"**Performance:** avg gain {avg_gain:+.1f}% across {len(gains)} points")
+                  print(f"**Align:** ±{avg_align:.1f}% — avg |baseline − official| / official")
+              print()
 
               evals = eval_by_script.get(script, {})
-              if evals:
-                  b_eval = evals.get("baseline", {}).get("eval_score")
-                  o_eval = evals.get("optimized", {}).get("eval_score")
-                  if b_eval is not None and o_eval is not None:
-                      diff = (o_eval - b_eval) * 100
-                      verdict = "OK" if diff >= -2.0 else "WARN"
-                      summary_parts.append(f"**GSM8K:** {b_eval*100:.1f}% → {o_eval*100:.1f}% ({diff:+.1f}pp, {verdict})")
-
-              print(" | ".join(summary_parts) + "\n")
 
               print("| Config | Official | Baseline | Optimized | Align | Gain | Verdict |")
               print("|--------|----------|----------|-----------|-------|------|---------|")
@@ -366,8 +357,7 @@ jobs:
                       diff_str = "N/A"
                   print(f"**GSM8K Accuracy:** baseline={b_str} | optimized={o_str} | delta={diff_str} | {verdict}\n")
 
-              note = "*Values: output\\_tput\\_per\\_gpu (output tok/s per GPU, ÷ TP)."
-              note += " tput\\_per\\_gpu (total) and input\\_tput\\_per\\_gpu also recorded in summary artifact."
+              note = "*Table values: output\\_tput\\_per\\_gpu (output tok/s per GPU, ÷ TP)."
               if ref_date:
                   note += f" Official ref: [InferenceX Dashboard](https://inferencex.semianalysis.com/inference) MI300X ({ref_date}).*"
               else:
@@ -523,12 +513,10 @@ jobs:
                   else:
                       eval_text = f"GSM8K: {b_str} \u2192 {o_str}"
 
-              subtitle = f"Avg Gain: {avg_gain:+.1f}%"
+              gain_line = f"**Avg Gain:** {avg_gain:+.1f}% — avg (optimized \u2212 baseline) / baseline across {len(complete)} configs"
+              align_line = ""
               if aligns:
-                  subtitle += f" | Align: \u00b1{avg_align:.1f}%"
-              subtitle += f" | {len(complete)}/{total_pairs} pairs"
-              if eval_text:
-                  subtitle += f" | {eval_text}"
+                  align_line = f"**Align:** \u00b1{avg_align:.1f}% — avg |baseline \u2212 official| / official"
 
               # GSM8K accuracy footer
               gsm8k_block = None
@@ -549,8 +537,7 @@ jobs:
               ref_date = ""
               if official:
                   ref_date = next(iter(official.values()), {}).get("date", "")
-              note = "Values: output_tput_per_gpu (output tok/s per GPU, ÷ TP)."
-              note += " tput_per_gpu (total) and input_tput_per_gpu also recorded in summary artifact."
+              note = "Table values: output_tput_per_gpu (output tok/s per GPU, \u00f7 TP)."
               if ref_date:
                   note += f" Official ref: [InferenceX Dashboard](https://inferencex.semianalysis.com/inference) MI300X ({ref_date})."
               else:
@@ -560,12 +547,13 @@ jobs:
                   {"type": "TextBlock", "weight": "Bolder", "size": "Medium",
                    "text": f"{icon} PR#{pr_num} Verify: {short}"},
                   {"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
-                   "text": subtitle},
-                  {"type": "TextBlock", "isSubtle": True, "spacing": "None", "size": "Small",
-                   "text": "output_tput_per_gpu (tok/s/gpu)"},
-                  {"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
-                   "columns": [{"width": 3}] + [{"width": 2}] * 5, "rows": detail_rows},
+                   "text": gain_line},
               ]
+              if align_line:
+                  body.append({"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
+                               "text": align_line})
+              body.append({"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
+                           "columns": [{"width": 3}] + [{"width": 2}] * 5, "rows": detail_rows})
               if gsm8k_block:
                   body.append(gsm8k_block)
               body.append({"type": "TextBlock", "isSubtle": True, "wrap": True, "size": "Small",
