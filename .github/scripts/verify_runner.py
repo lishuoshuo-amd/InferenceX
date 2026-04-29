@@ -23,10 +23,14 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from textwrap import dedent
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from safe_client import SaFEClient
 
@@ -61,6 +65,11 @@ def build_entrypoint(
         #!/bin/bash
         set -uo pipefail
 
+        NFS_DIR="{nfs_result_dir}"
+        mkdir -p "$NFS_DIR"
+        POD_LOG="$NFS_DIR/pod.log"
+        exec > >(stdbuf -oL tee -a "$POD_LOG") 2>&1
+
         echo "=== SaFE verify-pr pod started at $(date -u) ==="
         echo "Script: {script}"
         echo "Points: {len(runs)}"
@@ -75,44 +84,73 @@ def build_entrypoint(
             apt-get update -qq && apt-get install -y -qq git || true
         fi
 
-        NFS_DIR="{nfs_result_dir}"
-        mkdir -p "$NFS_DIR"
         SUMMARY="$NFS_DIR/summary-{script.replace('.sh', '')}.json"
         echo '[]' > "$SUMMARY"
 
-        # Clone repo (full history for checkout of base/head refs)
+        # Clone repo with full history; fetch upstream if base SHA missing (fork PR)
         REPO_DIR="/tmp/inferencex-repo"
         rm -rf "$REPO_DIR"
-        git clone --quiet {repo_url} "$REPO_DIR"
+        if ! git clone --quiet {repo_url} "$REPO_DIR"; then
+            echo "FATAL: git clone failed" >&2
+            exit 1
+        fi
         cd "$REPO_DIR"
+        # Fetch base SHA from upstream if not in fork history
+        if ! git cat-file -e "{base_sha}" 2>/dev/null; then
+            echo "Base SHA not in clone, fetching from upstream..."
+            git fetch --quiet origin "{base_sha}" 2>/dev/null || \
+            git fetch --quiet https://github.com/SemiAnalysisAI/InferenceX.git "{base_sha}" 2>/dev/null || true
+        fi
+        if ! git cat-file -e "{base_sha}" 2>/dev/null; then
+            echo "FATAL: base SHA {base_sha[:10]} not found" >&2
+            exit 1
+        fi
+        if ! git cat-file -e "{head_sha}" 2>/dev/null; then
+            echo "FATAL: head SHA {head_sha[:10]} not found" >&2
+            exit 1
+        fi
 
         RUNS_JSON='{runs_json_str}'
         NPTS=$(echo "$RUNS_JSON" | jq 'length')
         echo "Will run $NPTS points (x2 for baseline+optimized) for {script}"
 
         run_one() {{
-            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6
+            local mode=$1 ref=$2 tp=$3 conc=$4 isl=$5 osl=$6 ep=${{7:-1}}
             local mml=$((isl + osl + 200))
             local tag="${{mode}}-tp${{tp}}-conc${{conc}}-${{isl}}_${{osl}}"
 
             echo "--- Run $tag @ $ref ---"
-            local work="/tmp/work_${{tag}}"
-            rm -rf "$work" && mkdir -p "$work"
+            # Graceful stop (SIGTERM) then force kill (SIGKILL) as fallback
+            pkill -f "sglang.launch_server" 2>/dev/null || true
+            pkill -f "sglang.srt" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "vllm.entrypoints" 2>/dev/null || true
+            pkill -f "benchmark_serving" 2>/dev/null || true
+            pkill -f "ray::" 2>/dev/null || true
+            sleep 8
+            # Force kill anything still alive
+            pkill -9 -f "sglang" 2>/dev/null || true
+            pkill -9 -f "vllm" 2>/dev/null || true
+            sleep 2
+            fuser -k 8888/tcp 2>/dev/null || true
+            # Clean up leaked shared memory
+            rm -f /dev/shm/vllm_* /dev/shm/sglang_* 2>/dev/null || true
+            rm -rf /workspace && mkdir -p /workspace
 
             cd "$REPO_DIR"
-            git --work-tree="$work" checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
-                git --work-tree="$work" checkout "$ref" -- benchmarks utils
+            git --work-tree=/workspace checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
+                git --work-tree=/workspace checkout "$ref" -- benchmarks utils
 
             # Patch hf download to no-op (model is local on NFS)
             sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \\
-                "$work/benchmarks/single_node/{script}"
+                "/workspace/benchmarks/single_node/{script}"
 
             local result_file="verify-${{tag}}-{script.replace('.sh', '')}"
             set +e
-            cd "$work"
+            cd /workspace
 
             MODEL="{model_path}" \\
-            TP="$tp" CONC="$conc" \\
+            TP="$tp" CONC="$conc" EP_SIZE="$ep" \\
             ISL="$isl" OSL="$osl" MAX_MODEL_LEN="$mml" \\
             RANDOM_RANGE_RATIO="{random_range_ratio}" \\
             RESULT_FILENAME="$result_file" \\
@@ -121,26 +159,43 @@ def build_entrypoint(
             local rc=$?
             set -e
 
-            local result_json="$work/${{result_file}}.json"
-            local throughput="null"
+            local result_json="/workspace/${{result_file}}.json"
+            local output_tp="null" total_tp="null" request_tp="null"
             if [[ -f "$result_json" ]]; then
-                throughput=$(jq -r '.output_throughput // .total_token_throughput // .request_throughput // empty' "$result_json" || true)
+                output_tp=$(jq -r '.output_throughput // empty' "$result_json" 2>/dev/null || echo "null")
+                total_tp=$(jq -r '.total_token_throughput // empty' "$result_json" 2>/dev/null || echo "null")
+                request_tp=$(jq -r '.request_throughput // empty' "$result_json" 2>/dev/null || echo "null")
+            fi
+            # Convert to per-GPU (÷ TP, matching official process_result.py)
+            local otpg="null" tpg="null" itpg="null"
+            if [[ "$output_tp" != "null" && -n "$output_tp" ]]; then
+                otpg=$(echo "$output_tp $tp" | awk '{{printf "%.4f", $1/$2}}')
+            fi
+            if [[ "$total_tp" != "null" && -n "$total_tp" ]]; then
+                tpg=$(echo "$total_tp $tp" | awk '{{printf "%.4f", $1/$2}}')
+            fi
+            if [[ "$total_tp" != "null" && "$output_tp" != "null" && -n "$total_tp" && -n "$output_tp" ]]; then
+                itpg=$(echo "$total_tp $output_tp $tp" | awk '{{printf "%.4f", ($1-$2)/$3}}')
             fi
 
             # Copy artifacts to NFS
-            cp -f "$work/server.log" "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
+            cp -f /workspace/server.log "$NFS_DIR/${{tag}}.server.log" 2>/dev/null || true
             [[ -f "$result_json" ]] && cp -f "$result_json" "$NFS_DIR/${{result_file}}.json"
 
-            # Append to summary
-            jq --arg s "{script}" --arg m "$mode" --arg t "${{throughput:-null}}" \\
+            # Append to summary (per-GPU metrics aligned with official Dashboard)
+            jq --arg s "{script}" --arg m "$mode" \\
+               --arg otpg "$otpg" --arg tpg "$tpg" --arg itpg "$itpg" \\
                --arg tp "$tp" --arg c "$conc" --arg i "$isl" --arg o "$osl" --arg rc "$rc" \\
-               '. += [{{script:$s, mode:$m, throughput:($t|tonumber? // null),
+               '. += [{{script:$s, mode:$m,
+                       output_tput_per_gpu:($otpg|tonumber? // null),
+                       tput_per_gpu:($tpg|tonumber? // null),
+                       input_tput_per_gpu:($itpg|tonumber? // null),
                        tp:($tp|tonumber), conc:($c|tonumber),
                        isl:($i|tonumber), osl:($o|tonumber),
                        exit_code:($rc|tonumber)}}]' \\
                "$SUMMARY" > "$SUMMARY.tmp" && mv "$SUMMARY.tmp" "$SUMMARY"
 
-            echo "--- Done $tag (rc=$rc, throughput=$throughput) ---"
+            echo "--- Done $tag (rc=$rc, output_tput_per_gpu=$otpg, tput_per_gpu=$tpg) ---"
         }}
 
         for i in $(seq 0 $((NPTS - 1))); do
@@ -148,10 +203,95 @@ def build_entrypoint(
             conc=$(echo "$RUNS_JSON" | jq -r ".[$i].conc")
             isl=$(echo "$RUNS_JSON" | jq -r ".[$i].isl")
             osl=$(echo "$RUNS_JSON" | jq -r ".[$i].osl")
-            echo "=== point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ==="
-            run_one baseline  "{base_sha}" "$tp" "$conc" "$isl" "$osl"
-            run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl"
+            ep=$(echo "$RUNS_JSON" | jq -r ".[$i].ep // 1")
+            echo "=== point $((i+1))/$NPTS: tp=$tp conc=$conc isl=$isl osl=$osl ep=$ep ==="
+            run_one baseline  "{base_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
+            run_one optimized "{head_sha}" "$tp" "$conc" "$isl" "$osl" "$ep"
         done
+
+        # ── GSM8K accuracy eval (once per script, using the first point's TP/EP) ──
+        # Uses EVAL_ONLY=true so the benchmark script:
+        #   1. Calls setup_eval_context → sets correct EVAL_MAX_MODEL_LEN for server
+        #   2. Starts server with eval-appropriate context length
+        #   3. Skips run_benchmark_serving (no throughput run)
+        #   4. Runs run_eval (GSM8K via lm-eval) only
+        run_eval_once() {{
+            local mode=$1 ref=$2 tp=$3 ep=$4
+            local tag="eval-${{mode}}"
+
+            echo "--- Eval $tag @ $ref (tp=$tp ep=$ep) ---"
+            pkill -f "sglang.launch_server" 2>/dev/null || true
+            pkill -f "sglang.srt" 2>/dev/null || true
+            pkill -f "vllm serve" 2>/dev/null || true
+            pkill -f "vllm.entrypoints" 2>/dev/null || true
+            pkill -f "ray::" 2>/dev/null || true
+            sleep 8
+            pkill -9 -f "sglang" 2>/dev/null || true
+            pkill -9 -f "vllm" 2>/dev/null || true
+            sleep 2
+            fuser -k 8888/tcp 2>/dev/null || true
+            rm -f /dev/shm/vllm_* /dev/shm/sglang_* 2>/dev/null || true
+            rm -rf /workspace && mkdir -p /workspace
+
+            cd "$REPO_DIR"
+            git --work-tree=/workspace checkout "$ref" -- benchmarks utils runners 2>/dev/null || \\
+                git --work-tree=/workspace checkout "$ref" -- benchmarks utils
+
+            sed -i 's|^[[:space:]]*hf download.*|true # patched: model is local|' \\
+                "/workspace/benchmarks/single_node/{script}"
+
+            local result_file="verify-${{tag}}-{script.replace('.sh', '')}"
+            set +e
+            cd /workspace
+
+            MODEL="{model_path}" \\
+            TP="$tp" CONC=32 EP_SIZE="$ep" \\
+            ISL=1024 OSL=8192 MAX_MODEL_LEN=16384 \\
+            RANDOM_RANGE_RATIO="{random_range_ratio}" \\
+            RESULT_FILENAME="$result_file" \\
+            RUN_EVAL=true EVAL_ONLY=true EXP_NAME=verify-eval \\
+                bash benchmarks/single_node/{script}
+            local rc=$?
+            set -e
+
+            # Extract GSM8K score from lm-eval results
+            local eval_score="null"
+            local eval_json
+            eval_json=$(find /workspace -path "*/results*.json" -name "results*.json" 2>/dev/null | head -1)
+            if [[ -n "$eval_json" && -f "$eval_json" ]]; then
+                eval_score=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$eval_json'))
+    r = d.get('results', {{}})
+    for task, metrics in r.items():
+        for k in ['exact_match,strict-match', 'exact_match,flexible-extract', 'acc,none']:
+            if k in metrics:
+                print(f'{{metrics[k]:.4f}}')
+                sys.exit(0)
+    print('null')
+except Exception:
+    print('null')
+" 2>/dev/null || echo "null")
+                cp -f "$eval_json" "$NFS_DIR/${{tag}}-results.json" 2>/dev/null || true
+            fi
+
+            # Append eval result to summary
+            jq --arg s "{script}" --arg m "$mode" --arg es "$eval_score" --arg rc "$rc" \\
+               '. += [{{script:$s, mode:($m + "-eval"),
+                       eval_score:($es|tonumber? // null),
+                       exit_code:($rc|tonumber)}}]' \\
+               "$SUMMARY" > "$SUMMARY.tmp" && mv "$SUMMARY.tmp" "$SUMMARY"
+
+            echo "--- Done $tag (rc=$rc, eval_score=$eval_score) ---"
+        }}
+
+        EVAL_TP=$(echo "$RUNS_JSON" | jq -r '.[0].tp')
+        EVAL_EP=$(echo "$RUNS_JSON" | jq -r '.[0].ep // 1')
+        echo ""
+        echo "=== GSM8K eval phase (tp=$EVAL_TP ep=$EVAL_EP) ==="
+        run_eval_once baseline  "{base_sha}" "$EVAL_TP" "$EVAL_EP"
+        run_eval_once optimized "{head_sha}" "$EVAL_TP" "$EVAL_EP"
 
         echo ""
         echo "=== Summary for {script} ==="
@@ -163,6 +303,10 @@ def build_entrypoint(
 
 def run(args: argparse.Namespace) -> int:
     """Main: create SaFE workload, poll, collect results."""
+    if not args.safe_api_base:
+        log.error("SAFE_API_BASE not set — configure it as a GitHub secret or pass --safe-api-base")
+        return 1
+
     log.info("Script: %s | Points: %d | Image: %s", args.script, len(args.runs), args.image)
 
     client = SaFEClient(
@@ -172,6 +316,13 @@ def run(args: argparse.Namespace) -> int:
     )
 
     nfs_result_dir = args.nfs_result_dir
+    import shutil
+    if os.path.exists(nfs_result_dir):
+        shutil.rmtree(nfs_result_dir, ignore_errors=True)
+        # NFS may leave .nfs* stale handles; retry after short delay
+        if os.path.exists(nfs_result_dir):
+            time.sleep(2)
+            shutil.rmtree(nfs_result_dir, ignore_errors=True)
     os.makedirs(nfs_result_dir, exist_ok=True)
 
     entrypoint = build_entrypoint(
@@ -188,7 +339,8 @@ def run(args: argparse.Namespace) -> int:
     )
 
     script_stem = args.script.replace(".sh", "")
-    workload_name = f"verify-{script_stem}-{args.head_sha[:8]}"
+    safe_name = re.sub(r"[^a-z0-9-]", "-", script_stem.lower()).strip("-")
+    workload_name = f"vpr-{safe_name}-{args.head_sha[:8]}"[:44]
 
     log.info("Creating SaFE workload: %s", workload_name)
     workload = client.create_workload(
@@ -211,12 +363,61 @@ def run(args: argparse.Namespace) -> int:
 
     log.info("Workload submitted: %s", workload_id)
 
-    status = client.poll_until_done(
-        workload_id,
-        timeout=args.timeout,
-        interval=30,
-        heartbeat_interval=300,
-    )
+    # Poll with live log tailing from NFS
+    pod_log_path = Path(nfs_result_dir) / "pod.log"
+    log_offset = 0
+    start = time.time()
+    status = "running"
+
+    while True:
+        elapsed = time.time() - start
+        if elapsed > args.timeout:
+            log.warning("Timeout after %ds, stopping workload", args.timeout)
+            client.stop_workload(workload_id)
+            status = "timeout"
+            break
+
+        try:
+            wl_status, wl_phase = client.get_workload_status(workload_id)
+        except Exception as e:
+            log.warning("Poll error: %s", e)
+            time.sleep(30)
+            continue
+
+        # Stream pod.log incremental content
+        if pod_log_path.exists():
+            try:
+                with open(pod_log_path, "r", errors="replace") as f:
+                    f.seek(log_offset)
+                    new_content = f.read()
+                    if new_content:
+                        print(new_content, end="", flush=True)
+                        log_offset += len(new_content)
+            except Exception:
+                pass
+
+        if wl_phase in ("succeeded", "completed") or wl_status in ("succeeded", "completed"):
+            log.info("Workload %s completed (%.0fs)", workload_id, elapsed)
+            status = "completed"
+            break
+        if wl_phase == "failed" or wl_status == "failed":
+            log.error("Workload %s failed (%.0fs)", workload_id, elapsed)
+            status = "failed"
+            break
+
+        time.sleep(30)
+
+    # Final flush of pod log
+    if pod_log_path.exists():
+        try:
+            with open(pod_log_path, "r", errors="replace") as f:
+                f.seek(log_offset)
+                remaining = f.read()
+                if remaining:
+                    print(remaining, end="", flush=True)
+        except Exception:
+            pass
+
     log.info("Workload %s finished: %s", workload_id, status)
 
     # Collect results from NFS -> local output dir
@@ -227,8 +428,8 @@ def run(args: argparse.Namespace) -> int:
     nfs_summary = Path(nfs_result_dir) / summary_name
     local_summary = output_dir / summary_name
 
+    import shutil
     if nfs_summary.exists():
-        import shutil
         shutil.copy2(nfs_summary, local_summary)
         log.info("Summary copied: %s -> %s", nfs_summary, local_summary)
 
@@ -238,8 +439,81 @@ def run(args: argparse.Namespace) -> int:
         for f in Path(nfs_result_dir).glob("*.server.log"):
             shutil.copy2(f, output_dir / f.name)
     else:
-        log.warning("Summary not found at %s", nfs_summary)
+        log.error("Summary not found at %s — pod likely crashed before any benchmark ran", nfs_summary)
         local_summary.write_text("[]")
+        return 1
+
+    # Validate results: separate throughput rows from eval rows
+    import json as _json
+    from collections import defaultdict
+    results = _json.loads(local_summary.read_text())
+
+    throughput_results = [r for r in results if not r.get("mode", "").endswith("-eval")]
+    eval_results = [r for r in results if r.get("mode", "").endswith("-eval")]
+
+    total = len(throughput_results)
+    ok = sum(1 for r in throughput_results
+             if r.get("output_tput_per_gpu") and r["output_tput_per_gpu"] > 0)
+    fail = total - ok
+    log.info("Throughput results: %d total, %d ok, %d failed", total, ok, fail)
+
+    if total == 0:
+        log.error("No benchmark results produced")
+        return 1
+
+    expected_points = len(args.runs) * 2  # baseline + optimized per point
+    if total < expected_points:
+        log.warning("Incomplete: %d/%d throughput results (pod may have been killed early)",
+                     total, expected_points)
+
+    # Check paired completeness (throughput only)
+    buckets = defaultdict(dict)
+    for r in throughput_results:
+        key = (r["tp"], r["conc"], r["isl"], r["osl"])
+        buckets[key][r["mode"]] = r
+
+    paired_ok = 0
+    paired_fail = 0
+    for key, modes in buckets.items():
+        b = modes.get("baseline", {})
+        o = modes.get("optimized", {})
+        bt = b.get("output_tput_per_gpu") if b else None
+        ot = o.get("output_tput_per_gpu") if o else None
+        if bt and bt > 0 and ot and ot > 0:
+            paired_ok += 1
+        else:
+            paired_fail += 1
+            missing = []
+            if not (bt and bt > 0): missing.append("baseline")
+            if not (ot and ot > 0): missing.append("optimized")
+            log.warning("Incomplete pair tp=%s conc=%s isl=%s osl=%s: missing %s",
+                        key[0], key[1], key[2], key[3], "+".join(missing))
+
+    log.info("Paired results: %d complete / %d incomplete out of %d points",
+             paired_ok, paired_fail, len(buckets))
+
+    if paired_ok == 0:
+        log.error("No complete baseline+optimized pairs — verify cannot proceed")
+        return 1
+
+    # Validate GSM8K eval results (hard requirement: both must produce a score)
+    eval_modes = {r["mode"].replace("-eval", ""): r for r in eval_results}
+    eval_ok = True
+    for mode_name in ("baseline", "optimized"):
+        er = eval_modes.get(mode_name)
+        if not er:
+            log.error("GSM8K eval missing for %s — no eval row in summary", mode_name)
+            eval_ok = False
+        elif er.get("eval_score") is None:
+            log.error("GSM8K eval produced no score for %s (exit_code=%s)",
+                       mode_name, er.get("exit_code"))
+            eval_ok = False
+        else:
+            log.info("GSM8K eval %s: score=%.4f", mode_name, er["eval_score"])
+
+    if not eval_ok:
+        log.error("GSM8K eval did not complete successfully for both baseline and optimized")
+        return 1
 
     if status != "completed":
         log.error("Workload did not complete successfully: %s", status)
@@ -263,7 +537,8 @@ def main():
     parser.add_argument("--nfs-result-dir", required=True, help="NFS directory for pod to write results")
     parser.add_argument("--output-dir", default="verify-results", help="Local output dir for CI artifacts")
 
-    parser.add_argument("--safe-api-base", default="https://oci-slc.primus-safe.amd.com")
+    parser.add_argument("--safe-api-base", default=os.environ.get("SAFE_API_BASE", ""),
+                        help="SaFE API base URL (or set SAFE_API_BASE env var)")
     parser.add_argument("--safe-api-key", default=os.environ.get("SAFE_API_KEY", ""))
     parser.add_argument("--safe-workspace-id", default=os.environ.get("SAFE_WORKSPACE_ID", ""))
     parser.add_argument("--no-verify-ssl", action="store_true", default=False)

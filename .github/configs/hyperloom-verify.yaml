@@ -14,26 +14,45 @@
 # any upstream sweep / matrix logic.
 
 scripts:
-  dsr1_fp8_mi355x.sh:
-    model_path: /hyperloom/models/DeepSeek-R1-0528
-    master_config_key: dsr1-fp8-mi355x-sglang
+  dsr1_fp8_mi300x.sh:
+    model_path: /wekafs/models/DeepSeek-R1-0528
+    master_config_key: dsr1-fp8-mi300x-sglang
+    dashboard_model: DeepSeek-R1-0528
+    dashboard_precision: fp8
+    dashboard_framework: sglang
 
-  qwen3.5_bf16_mi355x.sh:
-    model_path: /hyperloom/models/Qwen-Qwen3.5-397B-A17B
-    master_config_key: qwen3.5-bf16-mi355x-sglang
+  qwen3.5_bf16_mi300x.sh:
+    model_path: /wekafs/models/Qwen-Qwen3.5-397B-A17B
+    master_config_key: qwen3.5-bf16-mi300x-sglang
+    dashboard_model: Qwen-3.5-397B-A17B
+    dashboard_precision: bf16
+    dashboard_framework: sglang
 
-  glm5_fp8_mi355x.sh:
-    model_path: /hyperloom/models/zai-org-GLM-5-FP8
-    master_config_key: glm5-fp8-mi355x-sglang
+  # TODO: re-enable once amd-master.yaml adds `glm5-fp8-mi300x-sglang`.
+  # glm5_fp8_mi300x.sh:
+  #   model_path: /wekafs/models/GLM-5-FP8
+  #   master_config_key: glm5-fp8-mi300x-sglang
+  #   dashboard_model: GLM-5
+  #   dashboard_precision: fp8
+  #   dashboard_framework: sglang
 
-  kimik2.5_int4_mi355x.sh:
-    model_path: /hyperloom/models/Kimi-K2.5
-    master_config_key: kimik2.5-int4-mi355x-vllm
+  kimik2.5_int4_mi300x.sh:
+    model_path: /wekafs/models/Kimi-K2.5
+    master_config_key: kimik2.5-int4-mi300x-vllm
+    dashboard_model: Kimi-K2.5
+    dashboard_precision: int4
+    dashboard_framework: vllm
 
-  minimaxm2.5_fp8_mi355x.sh:
-    model_path: /hyperloom/models/MiniMaxAI-MiniMax-M2.5
-    master_config_key: minimaxm2.5-fp8-mi355x-vllm
+  minimaxm2.5_fp8_mi300x.sh:
+    model_path: /wekafs/models/MiniMaxAI-MiniMax-M2.5
+    master_config_key: minimaxm2.5-fp8-mi300x-vllm
+    dashboard_model: MiniMax-M2.5
+    dashboard_precision: fp8
+    dashboard_framework: vllm
 
-  gptoss_fp4_mi355x.sh:
-    model_path: /hyperloom/models/gpt-oss-120b
-    master_config_key: gptoss-fp4-mi355x-vllm
+  gptoss_fp4_mi300x.sh:
+    model_path: /wekafs/models/gpt-oss-120b
+    master_config_key: gptoss-fp4-mi300x-vllm
+    dashboard_model: gpt-oss-120b
+    dashboard_precision: fp4
+    dashboard_framework: vllm
