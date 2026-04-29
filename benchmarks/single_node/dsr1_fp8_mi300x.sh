@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# [test] verify-pr dashboard + per-gpu metrics — remove this line after test
 
 source "$(dirname "$0")/../benchmark_lib.sh"
 

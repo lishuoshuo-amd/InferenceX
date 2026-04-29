@@ -310,21 +310,12 @@ jobs:
 
               avg_gain = sum(gains) / len(gains) if gains else 0
               avg_align = sum(abs(a) for a in aligns) / len(aligns) if aligns else 0
-              summary_parts = []
+              print(f"**Avg Gain:** {avg_gain:+.1f}% — avg (optimized − baseline) / baseline across {len(gains)} configs")
               if aligns:
-                  summary_parts.append(f"**Alignment:** avg ±{avg_align:.1f}% vs Dashboard ({ref_date})")
-              summary_parts.append(f"**Performance:** avg gain {avg_gain:+.1f}% across {len(gains)} points")
+                  print(f"**Align:** ±{avg_align:.1f}% — avg |baseline − official| / official")
+              print()
 
               evals = eval_by_script.get(script, {})
-              if evals:
-                  b_eval = evals.get("baseline", {}).get("eval_score")
-                  o_eval = evals.get("optimized", {}).get("eval_score")
-                  if b_eval is not None and o_eval is not None:
-                      diff = (o_eval - b_eval) * 100
-                      verdict = "OK" if diff >= -2.0 else "WARN"
-                      summary_parts.append(f"**GSM8K:** {b_eval*100:.1f}% → {o_eval*100:.1f}% ({diff:+.1f}pp, {verdict})")
-
-              print(" | ".join(summary_parts) + "\n")
 
               print("| Config | Official | Baseline | Optimized | Align | Gain | Verdict |")
               print("|--------|----------|----------|-----------|-------|------|---------|")
@@ -366,8 +357,7 @@ jobs:
                       diff_str = "N/A"
                   print(f"**GSM8K Accuracy:** baseline={b_str} | optimized={o_str} | delta={diff_str} | {verdict}\n")
 
-              note = "*Values: output\\_tput\\_per\\_gpu (output tok/s per GPU, ÷ TP)."
-              note += " tput\\_per\\_gpu (total) and input\\_tput\\_per\\_gpu also recorded in summary artifact."
+              note = "*Table values: output\\_tput\\_per\\_gpu (output tok/s per GPU, ÷ TP)."
               if ref_date:
                   note += f" Official ref: [InferenceX Dashboard](https://inferencex.semianalysis.com/inference) MI300X ({ref_date}).*"
               else:
@@ -473,7 +463,7 @@ jobs:
               icon = "\u2705" if avg_gain >= -2.0 else "\u26a0\ufe0f"
               short = script.replace(".sh", "")
 
-              header = ["Config", "Official", "Baseline", "Optimized", "Gain"]
+              header = ["Config", "Official", "Baseline", "Optimized", "Align", "Gain"]
               detail_rows = [{"type": "TableRow", "style": "accent", "cells": [
                   {"type": "TableCell", "items": [{"type": "TextBlock", "text": c, "weight": "Bolder", "size": "Small"}]}
                   for c in header
@@ -490,12 +480,23 @@ jobs:
                   osl_s = f"{osl//1024}k" if osl % 1024 == 0 else str(osl)
                   config = f"{isl_s}/{osl_s} tp{tp} c{conc}"
                   rt_s = f"{rt:.1f}" if rt else "N/A"
+
+                  if rt and rt > 0:
+                      align_pct = (bt - rt) / rt * 100
+                      align_s = f"{align_pct:+.1f}%"
+                      align_color = "Attention" if abs(align_pct) > 10 else "Default"
+                  else:
+                      align_s = "N/A"
+                      align_color = "Default"
+
                   gc = "Good" if gain > 0 else "Attention" if gain < -2 else "Default"
+
                   detail_rows.append({"type": "TableRow", "cells": [
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": config, "size": "Small"}]},
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": rt_s, "size": "Small"}]},
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{bt:.1f}", "size": "Small"}]},
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{ot:.1f}", "size": "Small"}]},
+                      {"type": "TableCell", "items": [{"type": "TextBlock", "text": align_s, "size": "Small", "color": align_color}]},
                       {"type": "TableCell", "items": [{"type": "TextBlock", "text": f"{gain:+.1f}%", "size": "Small", "color": gc, "weight": "Bolder"}]},
                   ]})
 
@@ -512,23 +513,51 @@ jobs:
                   else:
                       eval_text = f"GSM8K: {b_str} \u2192 {o_str}"
 
-              subtitle = f"Avg Gain: {avg_gain:+.1f}%"
+              gain_line = f"**Avg Gain:** {avg_gain:+.1f}% — avg (optimized \u2212 baseline) / baseline across {len(complete)} configs"
+              align_line = ""
               if aligns:
-                  subtitle += f" | Align: \u00b1{avg_align:.1f}%"
-              subtitle += f" | {len(complete)}/{total_pairs} pairs"
-              if eval_text:
-                  subtitle += f" | {eval_text}"
+                  align_line = f"**Align:** \u00b1{avg_align:.1f}% — avg |baseline \u2212 official| / official"
+
+              # GSM8K accuracy footer
+              gsm8k_block = None
+              if evals:
+                  b_s = evals.get("baseline", {}).get("eval_score")
+                  o_s = evals.get("optimized", {}).get("eval_score")
+                  b_str = f"{b_s*100:.1f}%" if b_s is not None else "N/A"
+                  o_str = f"{o_s*100:.1f}%" if o_s is not None else "N/A"
+                  if b_s is not None and o_s is not None:
+                      diff = (o_s - b_s) * 100
+                      ev = "OK" if diff >= -2.0 else "WARN: accuracy drop"
+                      gsm8k_line = f"**GSM8K Accuracy:** baseline={b_str} | optimized={o_str} | delta={diff:+.1f}pp | {ev}"
+                  else:
+                      gsm8k_line = f"**GSM8K Accuracy:** baseline={b_str} | optimized={o_str} | delta=N/A | N/A"
+                  gsm8k_block = {"type": "TextBlock", "wrap": True, "size": "Small",
+                                 "spacing": "Small", "text": gsm8k_line}
+
+              ref_date = ""
+              if official:
+                  ref_date = next(iter(official.values()), {}).get("date", "")
+              note = "Table values: output_tput_per_gpu (output tok/s per GPU, \u00f7 TP)."
+              if ref_date:
+                  note += f" Official ref: [InferenceX Dashboard](https://inferencex.semianalysis.com/inference) MI300X ({ref_date})."
+              else:
+                  note += " Official ref: N/A (Dashboard unavailable)."
 
               body = [
                   {"type": "TextBlock", "weight": "Bolder", "size": "Medium",
                    "text": f"{icon} PR#{pr_num} Verify: {short}"},
                   {"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
-                   "text": subtitle},
-                  {"type": "TextBlock", "isSubtle": True, "spacing": "None", "size": "Small",
-                   "text": "output_tput_per_gpu (tok/s/gpu)"},
-                  {"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
-                   "columns": [{"width": 2}] + [{"width": 1}] * 4, "rows": detail_rows},
+                   "text": gain_line},
               ]
+              if align_line:
+                  body.append({"type": "TextBlock", "isSubtle": True, "spacing": "None", "wrap": True, "size": "Small",
+                               "text": align_line})
+              body.append({"type": "Table", "gridStyle": "accent", "firstRowAsHeader": True,
+                           "columns": [{"width": 3}] + [{"width": 2}] * 5, "rows": detail_rows})
+              if gsm8k_block:
+                  body.append(gsm8k_block)
+              body.append({"type": "TextBlock", "isSubtle": True, "wrap": True, "size": "Small",
+                           "spacing": "Small", "text": note})
 
               card = {"type": "message", "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": {
                   "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
