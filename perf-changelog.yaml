@@ -1,4 +1,16 @@
 - config-keys:
+    - kimik2.5-int4-mi300x-vllm
+  description:
+    - "Tune --max-num-seqs 256 → 128 (+34.2% avg output throughput gain)"
+  pr-link: TBD
+
+- config-keys:
+    - dsr1-fp8-mi300x-sglang
+  description:
+    - "Tune --mem-fraction-static 0.8 → 0.85, --num-continuous-decode-steps 4 → 16 (+4.2% avg output throughput gain)"
+  pr-link: TBD
+
+- config-keys:
     - kimik2.5-fp4-gb200-dynamo-trt
   description:
     - "Add Kimi K2.5 NVFP4 GB200 disaggregated TRT-LLM benchmarks via Dynamo (14 STP configs)"
