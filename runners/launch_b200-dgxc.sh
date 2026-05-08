@@ -1,7 +1,7 @@
 #!/usr/bin/bash
 
 # System-specific configuration for B200 DGXC Slurm cluster
-SLURM_PARTITION="gpu"
+SLURM_PARTITION="gpu-2"
 SLURM_ACCOUNT="benchmark"
 
 set -x
@@ -36,9 +36,15 @@ if [[ "$IS_MULTINODE" == "true" ]]; then
         rm -rf "$SRT_REPO_DIR"
     fi
 
-    git clone https://github.com/NVIDIA/srt-slurm.git "$SRT_REPO_DIR"
-    cd "$SRT_REPO_DIR" || exit 1
-    git checkout sa-submission-q2-2026
+    # TODO(CJQ): make first class upon srt-slurm upstream refactor
+    if [[ "$IS_AGENTIC" == "1" ]]; then
+        git clone --branch cam/sa-submission-q2-2026 --single-branch https://github.com/cquil11/srt-slurm-nv.git "$SRT_REPO_DIR"
+        cd "$SRT_REPO_DIR" || exit 1
+    else
+        git clone https://github.com/NVIDIA/srt-slurm.git "$SRT_REPO_DIR"
+        cd "$SRT_REPO_DIR" || exit 1
+        git checkout sa-submission-q2-2026
+    fi
 
     echo "Installing srtctl..."
     export UV_INSTALL_DIR="$GITHUB_WORKSPACE/.local/bin"
@@ -197,16 +203,20 @@ EOF
                 for result_file in $RESULT_FILES; do
                     if [ -f "$result_file" ]; then
                         # Extract metadata from filename
-                        # Files are of the format "results_concurrency_gpus_{num gpus}_ctx_{num ctx}_gen_{num gen}.json"
+                        # Files may be "results_concurrency_N_gpus_G_ctx_C_gen_D.json" (disagg) or "results_concurrency_N_gpus_G.json" (non-disagg)
                         filename=$(basename "$result_file")
                         concurrency=$(echo "$filename" | sed -n 's/results_concurrency_\([0-9]*\)_gpus_.*/\1/p')
-                        gpus=$(echo "$filename" | sed -n 's/results_concurrency_[0-9]*_gpus_\([0-9]*\)_ctx_.*/\1/p')
+                        gpus=$(echo "$filename" | sed -n 's/results_concurrency_[0-9]*_gpus_\([0-9][0-9]*\).*/\1/p')
                         ctx=$(echo "$filename" | sed -n 's/.*_ctx_\([0-9]*\)_gen_.*/\1/p')
                         gen=$(echo "$filename" | sed -n 's/.*_gen_\([0-9]*\)\.json/\1/p')
 
                         echo "Processing concurrency $concurrency with $gpus GPUs (ctx: $ctx, gen: $gen): $result_file"
 
-                        WORKSPACE_RESULT_FILE="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${CONFIG_NAME}_conc${concurrency}_gpus_${gpus}_ctx_${ctx}_gen_${gen}.json"
+                        if [ -n "$ctx" ] && [ -n "$gen" ]; then
+                            WORKSPACE_RESULT_FILE="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${CONFIG_NAME}_conc${concurrency}_gpus_${gpus}_ctx_${ctx}_gen_${gen}.json"
+                        else
+                            WORKSPACE_RESULT_FILE="$GITHUB_WORKSPACE/${RESULT_FILENAME}_${CONFIG_NAME}_conc${concurrency}_gpus_${gpus}.json"
+                        fi
                         cp "$result_file" "$WORKSPACE_RESULT_FILE"
 
                         echo "Copied result file to: $WORKSPACE_RESULT_FILE"
@@ -253,7 +263,26 @@ else
     SQUASH_FILE="/home/sa-shared/containers/$(echo "$IMAGE" | sed 's/[\/:@#]/_/g').sqsh"
     FRAMEWORK_SUFFIX=$([[ "$FRAMEWORK" == "trt" ]] && printf '_trt' || printf '')
     SPEC_SUFFIX=$([[ "$SPEC_DECODING" == "mtp" ]] && printf '_mtp' || printf '')
+    # Prefer a framework-tagged script (e.g. dsv4_fp4_b200_vllm.sh) so models
+    # with multiple inference engines can coexist; fall back to the historical
+    # name without an engine suffix (`_trt` for trt, bare for everyone else).
+    BENCH_BASE="benchmarks/single_node/${EXP_NAME%%_*}_${PRECISION}_b200"
+    BENCH_SCRIPT="${BENCH_BASE}_${FRAMEWORK}${SPEC_SUFFIX}.sh"
+    if [[ ! -f "$BENCH_SCRIPT" ]]; then
+        BENCH_SCRIPT="${BENCH_BASE}${FRAMEWORK_SUFFIX}${SPEC_SUFFIX}.sh"
+    fi
     LOCK_FILE="${SQUASH_FILE}.lock"
+
+    # TODO(Cam): lmsysorg/sglang:deepseek-v4-blackwell installs sglang editable at
+    # /workspace/sglang/python (prior sglang tags used /sgl-workspace/sglang), so
+    # the default $GITHUB_WORKSPACE:/workspace/ bind-mount masks the install and
+    # breaks `import sglang`. Mount this one image at /ix instead; drop the
+    # conditional once the image stops installing editable under /workspace.
+    if [[ "$IMAGE" == *deepseek-v4-blackwell* ]]; then
+        CONTAINER_MOUNT_DIR=/ix
+    else
+        CONTAINER_MOUNT_DIR=/workspace
+    fi
 
     salloc --partition=$SLURM_PARTITION --account=$SLURM_ACCOUNT --gres=gpu:$TP --exclusive --time=180 --no-shell --job-name="$RUNNER_NAME"
     JOB_ID=$(squeue --name="$RUNNER_NAME" -u "$USER" -h -o %A | head -n1)
@@ -275,9 +304,9 @@ else
 
     srun --jobid=$JOB_ID \
         --container-image=$SQUASH_FILE \
-        --container-mounts=$GITHUB_WORKSPACE:/workspace/,$HF_HUB_CACHE_MOUNT:$HF_HUB_CACHE \
+        --container-mounts=$GITHUB_WORKSPACE:$CONTAINER_MOUNT_DIR,$HF_HUB_CACHE_MOUNT:$HF_HUB_CACHE \
         --no-container-mount-home \
-        --container-workdir=/workspace/ \
+        --container-workdir=$CONTAINER_MOUNT_DIR \
         --no-container-entrypoint --export=ALL,PORT=8888 \
-        bash benchmarks/single_node/${EXP_NAME%%_*}_${PRECISION}_b200${FRAMEWORK_SUFFIX}${SPEC_SUFFIX}.sh
+        bash "$BENCH_SCRIPT"
 fi

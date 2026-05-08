@@ -112,6 +112,7 @@ When working with benchmark configurations, use these valid values:
 
 **Models (model-prefix)**:
 - `dsr1` - DeepSeek-R1-0528
+- `dsv4` - DeepSeek-V4-Pro
 - `gptoss` - GPT-OSS-120B
 
 **Precisions**:
@@ -169,8 +170,22 @@ When working with benchmark configurations, use these valid values:
 ### Git
 
 - Conventional commit messages
-- Use `[skip-sweep]` in commit message to skip benchmarks
+- Use `[skip-sweep]` in commit message to skip benchmarks (push-to-main only)
 - Changes to `perf-changelog.yaml` trigger benchmark runs
+
+### Pull Request Sweep Labels
+
+PRs do **not** run the sweep automatically — `run-sweep.yml` is gated on a label. Pick exactly one of the two; setting both is rejected by the workflow.
+
+| Label | Behavior | When to use |
+|-------|----------|-------------|
+| `sweep-enabled` | Runs the sweep with `--trim-conc`: each parallelism config is reduced to its single highest configured concurrency point. | Default for most PRs — validates the change runs end-to-end without consuming the full cluster. |
+| `full-sweep-enabled` | Runs the full intermediate concurrency sweep, identical to a push-to-main run. | Use when intermediate concurrency points actually matter for the PR (e.g., a recipe change expected to shift the throughput/latency curve, not just its endpoints). |
+
+Notes:
+- The two labels are mutually exclusive — `run-sweep.yml`'s `setup` job fails fast with an explicit error if both are present.
+- Push-to-main always runs the full (untrimmed) sweep unless `[skip-sweep]` is in the commit message; the trim only applies to PR runs that opt in via `sweep-enabled`.
+- The trimming logic lives in `trim_conc()` in `utils/process_changelog.py` — single-node entries are grouped by every non-`conc` field and only the highest-`conc` entry per group is kept; multi-node entries have their `conc` list collapsed to `[max(conc)]`.
 
 ## Common Tasks
 
@@ -216,12 +231,13 @@ dsr1-fp8-h200-dynamo-sglang:
   framework: dynamo-sglang
   multinode: true
   disagg: true
-  seq-len-configs:
-  - isl: 1024
-    osl: 1024
-    search-space:
-    - conc-list: [1, 4, 16, 32, 64, 128, 256, 512]
-      prefill:
+  scenarios:
+    fixed-seq-len:
+    - isl: 1024
+      osl: 1024
+      search-space:
+      - conc-list: [1, 4, 16, 32, 64, 128, 256, 512]
+        prefill:
         num-worker: 1
         tp: 8
         ep: 1
@@ -479,6 +495,7 @@ Markers available: `slow`, `integration`
 
 ## Important Notes
 1. Make sure no new directories are created in `/workspace` during the benchmark. Files are ok.
+2. **Never delete or modify whitespace in `perf-changelog.yaml`** — the CI pipeline depends on the exact whitespace (including trailing spaces on blank separator lines). Removing or altering whitespace will break CI and cause pipeline crashes.
 
 ## Fetching GitHub Actions Benchmark Results
 
