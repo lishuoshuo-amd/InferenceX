@@ -29,6 +29,6 @@ jobs:
             echo "Already up-to-date with upstream/main"
             exit 0
           fi
-          echo "Fork main is $BEHIND commit(s) behind upstream, rebasing"
-          git rebase upstream/main
-          git push --force-with-lease origin main
+          echo "Fork main is $BEHIND commit(s) behind upstream, merging"
+          git merge upstream/main --no-edit
+          git push origin main
