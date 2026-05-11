@@ -42,13 +42,34 @@ from typing import Any, AsyncGenerator, Collection, Dict, List, Optional, Tuple
 import numpy as np
 from backend_request_func import (ASYNC_REQUEST_FUNCS, RequestFuncInput,
                                   RequestFuncOutput)
+from backend_request_func import get_tokenizer as _hf_get_tokenizer
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
 
 try:
-    from vllm.transformers_utils.tokenizer import get_tokenizer
+    from vllm.transformers_utils.tokenizer import (
+        get_tokenizer as _vllm_get_tokenizer,
+    )
 except ImportError:
-    from backend_request_func import get_tokenizer
+    _vllm_get_tokenizer = None
+
+
+def get_tokenizer(*args, **kwargs):
+    """Load tokenizer via vLLM helper, with HF fallback for legacy vLLM bug.
+
+    Older vLLM (< v0.12.0, before upstream PR #29686) accesses
+    ``all_special_tokens_extended`` which is missing on some HF tokenizers
+    (e.g. Qwen2/Qwen3), crashing benchmark setup. Fall back to the local HF
+    AutoTokenizer path only for that specific AttributeError; re-raise others.
+    """
+    if _vllm_get_tokenizer is None:
+        return _hf_get_tokenizer(*args, **kwargs)
+    try:
+        return _vllm_get_tokenizer(*args, **kwargs)
+    except AttributeError as exc:
+        if "all_special_tokens_extended" not in str(exc):
+            raise
+        return _hf_get_tokenizer(*args, **kwargs)
 
 try:
     from vllm.utils import FlexibleArgumentParser
