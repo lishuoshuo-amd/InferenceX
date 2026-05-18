@@ -2653,3 +2653,10 @@
   description:
     - "Update SGLang image from v0.5.9-cu129-amd64 (74d old) to v0.5.12-cu130"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1458
+
+- config-keys:
+    - dsr1-fp8-mi325x-sglang
+  description:
+    - "Update SGLang image from v0.5.9-rocm700-mi30x to v0.5.12-rocm700-mi30x"
+    - "Workaround LlamaTokenizer.all_special_tokens_extended removal in newer transformers: prefer backend_request_func.get_tokenizer over vLLM's"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1428
