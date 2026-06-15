@@ -3611,6 +3611,22 @@
     - "MI355x DSR1-FP4: Include TP4 configurations for 8k1k"
     - "Expand the TP sweep (included TP=4) for 8k/1k configuration for conc=4 to 64"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1692
+
+- config-keys:
+    - qwen3.5-fp4-mi355x-sglang
+    - qwen3.5-fp4-mi355x-sglang-mtp
+  description:
+    - "Bump image from lmsysorg/sglang-rocm:v0.5.12.post1-rocm720-mi35x-20260604 to lmsysorg/sglang-rocm:v0.5.13-rocm720-mi35x-20260612"
+    - "Enable AITER_FLYDSL_FORCE=1 in both non-MTP and MTP benchmark scripts"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1716
+
+- config-keys:
+    - dsv4-fp4-mi355x-sglang
+  description:
+    - "Bump image to lmsysorg/sglang-rocm:v0.5.13-rocm720-mi35x-20260612."
+    - "Fix the intermediate_pad setting in the MoE computation in sglang PR#27858. This avoids the unnecessary overhead of computing useless padding."
+    - "Correct the chunk prefill setting size under tp8/dp8 config."
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1715
   
 
 - config-keys:
@@ -3755,3 +3771,74 @@
     - "TP8-only search space (gfx942 192 GB is memory-tight, like H100): TP8 latency rows started at conc 1, TP8+EP8 (TEP) at high concurrency, across 1k1k and 8k1k"
     - "[AI generated draft test] The shipped ROCm image's AMD MiniMax-M3 model lacks SupportsEagle3, so the recipe patches it in-place at runtime (functionstackx/vllm#1, upstream vllm-project/vllm#45546; validated green on MI355X) before serving — validates EAGLE3 on MI300X ahead of an image rebuild"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1749
+
+- config-keys:
+    - minimaxm3-fp8-mi300x-vllm
+  description:
+    - "Enable CUDA graphs for MiniMax-M3 MXFP8 on MI300X and set VLLM_USE_BREAKABLE_CUDAGRAPH=0 per AMD guidance"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1750
+
+- config-keys:
+    - minimaxm3-fp8-mi300x-vllm-mtp
+  description:
+    - "Run the MiniMax-M3 MXFP8 MI300X EAGLE3 MTP recipe with CUDA graphs instead of --enforce-eager"
+    - "Drop --enforce-eager and set VLLM_USE_BREAKABLE_CUDAGRAPH=0 (matching the non-MTP MI300X recipe, #1750), which avoids the M3-decode breakable-cudagraph path that previously forced eager execution"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1756
+
+- config-keys:
+    - minimaxm3-fp8-mi355x-vllm
+  description:
+    - "Enable CUDA graphs for MiniMax-M3 MXFP8 on MI355X, set VLLM_USE_BREAKABLE_CUDAGRAPH=0, and disable prefix caching"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1754
+
+- config-keys:
+    - minimaxm3-fp8-mi325x-vllm
+  description:
+    - "Initial submission: MiniMax-M3 MXFP8 day-zero single-node vLLM benchmark on MI325X / gfx942"
+    - "Follows the official MI325X MXFP8 recipe with vllm/vllm-openai-rocm:minimax-m3, block size 128, TRITON_ATTN, and MiniMax-M3 tool/reasoning parsers; fixed-sequence text benchmarking adds language-model-only, the default BF16 KV cache, disabled prefix caching, and a scenario-specific max model length"
+    - "H200-aligned layouts and concurrency ranges: TP4 and TP8 latency, TP4/TP8 expert parallelism, and TP8 data-parallel attention across 1k1k and 8k1k"
+    - "Route the MI325X Hugging Face cache and runtime compiler caches to node-local storage, and mount ROCm GPU devices explicitly"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1748
+
+- config-keys:
+    - minimaxm3-fp8-mi355x-vllm-mtp
+  description:
+    - "Run the MiniMax-M3 MXFP8 MI355X EAGLE3 MTP recipe with CUDA graphs instead of --enforce-eager"
+    - "Drop --enforce-eager and set VLLM_USE_BREAKABLE_CUDAGRAPH=0, which avoids the M3-decode breakable-cudagraph path that previously forced eager execution (the non-MTP MI355X recipe already got this in #1754)"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1755
+
+- config-keys:
+    - minimaxm3-fp8-mi325x-vllm-mtp
+  description:
+    - "Initial submission: MiniMax-M3 MXFP8 MI325X (gfx942) vLLM benchmark with EAGLE3 speculative decoding (target: MiniMaxAI/MiniMax-M3-MXFP8, draft: Inferact/MiniMax-M3-EAGLE3, 3 speculative tokens) — spec-decoding=mtp variant of the MI325X day-zero recipe (#1748)"
+    - "Image: vllm/vllm-openai-rocm:minimax-m3 (same day-zero ROCm build as the non-MTP entry)"
+    - "Serve shape follows minimaxm3-fp8-mi325x-vllm: --block-size 128, --no-enable-prefix-caching, --language-model-only, --attention-backend TRITON_ATTN, minimax_m3 parsers, default BF16 KV cache (gfx942 lacks calibrated ROCm FP8 attention scales). Runs with CUDA graphs (no --enforce-eager, VLLM_USE_BREAKABLE_CUDAGRAPH=0); prompts via chat template for realistic acceptance"
+    - "H200-style search space (TP4/TP8 latency, TP4+EP4/TP8+EP8 TEP, TP8+EP8 dp-attn DEP) trimmed at the extreme-concurrency end with TP-only latency rows started at conc 1"
+    - "[AI generated draft test] The shipped ROCm image's AMD MiniMax-M3 model lacks SupportsEagle3, so the recipe patches it in-place at runtime (functionstackx/vllm#1, upstream vllm-project/vllm#45546; validated green on MI355X/MI300X) before serving; also adds SPEC_SUFFIX to launch_mi325x-amds.sh so spec-decoding=mtp routes to the _mtp script"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1759
+
+- config-keys:
+    - minimaxm3-fp8-mi300x-vllm
+    - minimaxm3-fp8-mi325x-vllm
+  description:
+    - "Extend the MiniMax-M3 MXFP8 MI300X and MI325X non-MTP sweeps down to concurrency 1 on the TP-only latency rows (was conc 4), to capture the single-request latency point; TEP/DEP rows keep their higher concurrency starts"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1760
+
+- config-keys:
+    - minimaxm3-fp8-h100-vllm
+    - minimaxm3-fp8-h200-vllm
+  description:
+    - "Extend MiniMax-M3 MXFP8 H100/H200 non-MTP sweeps to concurrency 1 on the latency rows (H100: TP8; H200: TP4 and TP8) and add full TEP coverage from conc 1 to 256 (H100: TP8+EP8; H200: TP4+EP4 and TP8+EP8, incl. a new TP4+EP4 row for 8k1k). H200 TP8+EP8 upper bound moves 512->256 (high concurrency stays covered by the TP8+EP8 dp-attn DEP rows). DEP rows unchanged"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1761
+
+- config-keys:
+    - dsv4-fp4-gb300-dynamo-trt
+    - dsv4-fp4-gb300-dynamo-trt-mtp
+  description:
+    - "Add DeepSeek-V4-Pro MXFP4 GB300 disaggregated TRT-LLM benchmarks via Dynamo (27 STP + 27 MTP configs)"
+    - "New configs: dsv4-fp4-gb300-dynamo-trt (STP) and dsv4-fp4-gb300-dynamo-trt-mtp (MTP)"
+    - "Covers ISL 1024/OSL 1024 (14 STP + 14 MTP) and ISL 8192/OSL 1024 (13 STP + 13 MTP)"
+    - "Container: nvcr.io#nvidia/ai-dynamo/tensorrtllm-runtime:1.3.0-deepseek-v4-dev.1"
+    - "Recipes sourced from NVIDIA/srt-slurm branch sa-submission-q2-2026"
+    - "Runner script updated to support dsv4 model prefix with dynamo-trt framework on GB300"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1689
