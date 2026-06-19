@@ -2528,7 +2528,7 @@
     - minimaxm2.5-fp8-mi355x-vllm
   description:
     - "Update vLLM ROCm image from v0.19.0 to v0.21.0"
-  pr-link: XXX
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1410
 
 - config-keys:
     - gptoss-fp4-h200-vllm
@@ -2582,7 +2582,7 @@
     - dsr1-fp4-b300-sglang
   description:
     - "Update SGLang image from v0.5.11-cu130 to v0.5.12-cu130"
-  pr-link: XXX
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1418
 
 - config-keys:
     - kimik2.5-int4-h200-vllm
@@ -3699,7 +3699,7 @@
   description:
     - "Add MiniMax-M2.5 NVFP4 B200 TensorRT-LLM single-node benchmark (1k1k and 8k1k)"
     - "Image: nvcr.io#nvidia/tensorrt-llm/release:1.3.0rc18"
-  pr-link: https://github.com/NVIDIA/InferenceMAX/pull/1722
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1722
 
 - config-keys:
     - minimaxm3-fp8-h200-vllm-mtp
@@ -3950,3 +3950,19 @@
     - "Update ISL=8192 search-space: TP8-only from conc=4-64, DPA from conc=128-1024 (previously conc=1-64 and DPA conc=64-512)"
     - "Update Applied TBO on high concurrencies"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1717
+
+- config-keys:
+    - minimaxm3-fp8-mi300x-vllm
+  description:
+    - "Update the MI300X MiniMax-M3 vLLM image to vllm/vllm-openai-rocm:nightly-b53b1c7ffe7aebdafd0876350f30e51d1226c92a"
+    - "Use FP8 KV cache"
+    - "Exclude unprovisioned chi-mi300x-121 from Slurm allocation"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1837
+
+- config-keys:
+    - minimaxm3-fp8-mi300x-vllm-mtp
+  description:
+    - "Update the MI300X MiniMax-M3 EAGLE3 vLLM image to vllm/vllm-openai-rocm:nightly-b53b1c7ffe7aebdafd0876350f30e51d1226c92a"
+    - "Use FP8 KV cache"
+    - "Remove the runtime SupportsEagle3 source patch now included in the pinned nightly"
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1843
