@@ -4223,6 +4223,15 @@
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1914
 
 - config-keys:
+    - minimaxm3-fp8-gb300-dynamo-vllm
+  description:
+    - "Refresh GB300 MiniMax-M3 disagg recipe set: replace disagg-gb300-* files with new naming convention; drop TP4+Marlin variants."
+    - "1k/1k topologies (6 shapes): 1p1d-dep2-dep4 (conc 8192), 1p2d-dep2-tep8 (conc 4,16,64,128,256), 2p2d-dep2-tep8 (conc 32), 2p3d-dep2-dep4 (conc 8192), 2p4d-dep2-dep4 (conc 8192), 4p2d-dep2-dep8 (conc 1024,4096)."
+    - "8k/1k topologies (9 shapes): 1p1d-dep2-dep8 (conc 256), 1p1d-dep2-tep8 (conc 128), 1p2d-dep2-tep8 (conc 32,64,128), 2p1d-dep2-dep8 (conc 512), 2p2d-dep2-tep8 (conc 16), 2p4d-dep2-tep4 (conc 4), 3p1d-dep2-dep8 (conc 1024), 3p2d-dep2-dep8 (conc 512), 6p1d-dep2-dep8 (conc 2048)."
+    - "Image unchanged: vllm/vllm-openai:minimax-m3-perf-arm64-13.0.1-7a67223."
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1925
+
+- config-keys:
     - minimaxm3-fp4-b300-vllm
   description:
     - "Add MiniMax-M3 NVFP4 (nvidia/MiniMax-M3-NVFP4) B300 single-node aggregated vLLM benchmark (no spec decode)"
