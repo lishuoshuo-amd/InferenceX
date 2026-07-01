@@ -4369,3 +4369,11 @@
     - "Add OPT_ARGS: pass --online_quant_config '{\"global_quant_config\": \"ptpc_fp8\", \"exclude_layer\": [\"lm_head\", \"model.embed_tokens\", \"vision_tower\", \"multi_modal_projector\", \"patch_merge_mlp\", \"*block_sparse_moe\"]}' and --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}' to both scripts"
     - "Replace AITER_QUICK_REDUCE_CAST_BF16_TO_FP16=0 and ATOM_M3_SPARSE_USE_ASM_PA=1 with ATOM_FORCE_ATTN_TRITON=1"
   pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1968
+
+- config-keys:
+    - dsv4-fp4-b200-dynamo-vllm
+  description:
+    - "Add point-specific DeepSeek-V4-Pro FP4 B200 Dynamo-vLLM disaggregated recipes for the 8k/1k concurrency points c=1, 32, 64, 128, 256, 512."
+    - "Wire those rows in nvidia-master.yaml; c=16, 1024, 8192, and 12345 are not part of this update."
+    - "Recipes use vllm/vllm-openai:v0.23.0, DSV4 revision 0366e4e064385807ea86b088a5c6c878ff23343b, max-model-len 9280, with per-point P1/D1 (1 prefill node DEP=8 / 1 decode node) serving knobs."
+  pr-link: https://github.com/SemiAnalysisAI/InferenceX/pull/1963
